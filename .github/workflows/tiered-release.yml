@@ -1,6 +1,11 @@
 name: Tiered headless release
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/agm/tiered-effort.patch
+      - .github/workflows/tiered-release.yml
   schedule:
     - cron: '23 * * * *'
   workflow_dispatch:

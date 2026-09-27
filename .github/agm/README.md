@@ -6,4 +6,4 @@ The fixed budgets for tiered Flash are low 1000, medium 10000, high 32768, xhigh
 
 The workflow stops if an upstream change prevents a clean patch application, either focused test fails, or the source tree published on the maintained branch differs from the source tree compiled by the build job. It never publishes an unpatched upstream binary. Adapt the patch against the new upstream tag, test it, and commit the updated patch to this fork's `main` to retry. A changed patch SHA creates a distinct release tag.
 
-The scheduled workflow must be enabled on this fork in GitHub Actions. Manual `workflow_dispatch` is also available. The release is a build artifact; proxy-sg switches binaries only after its separate idle and manifest checks.
+The scheduled workflow must be enabled on this fork in GitHub Actions. Changes to the patch or workflow on `main` also trigger a check immediately. Manual `workflow_dispatch` is available, including a verification-only mode for existing releases. The release is a build artifact; proxy-sg switches binaries only after its separate idle and manifest checks.
