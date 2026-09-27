@@ -1,6 +1,6 @@
 # Maintained tiered headless build
 
-The `tiered-release.yml` workflow polls the latest stable release from `lbjlaq/Antigravity-Manager`. It checks out that exact upstream commit, applies `tiered-effort.patch`, runs the two focused Rust tests, and builds the Linux x86-64 headless binary. A successful build updates `custom/tiered-effort` and publishes a release tagged `tiered-vX.Y.Z-<patch SHA prefix>` with the binary and the proxy-sg manifest.
+The `tiered-release.yml` workflow polls the latest stable release from `lbjlaq/Antigravity-Manager`. It checks out that exact upstream commit, applies `tiered-effort.patch`, runs Rust formatting and Clippy checks plus the two focused Rust tests, and builds the Linux x86-64 headless binary. A successful build updates `custom/tiered-effort` and publishes a release tagged `tiered-vX.Y.Z-<patch SHA prefix>` with the binary and the proxy-sg manifest.
 
 The fixed budgets for tiered Flash are low 1000, medium 10000, high 32768, xhigh 49152, and max 65535. The patch also preserves `maxOutputTokens=65536` for max and removes the internal effort marker before upstream I/O.
 

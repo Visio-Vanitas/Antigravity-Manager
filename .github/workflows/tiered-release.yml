@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '23 * * * *'
   workflow_dispatch:
+    inputs:
+      verify_existing:
+        description: Re-run all build checks for the current release without publishing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,6 +56,9 @@ jobs:
             404) needed=true ;;
             *) echo "Release lookup failed: HTTP $status" >&2; exit 1 ;;
           esac
+          if [[ '${{ inputs.verify_existing }}' == 'true' ]]; then
+            needed=true
+          fi
           {
             echo "needed=$needed"
             echo "version=$version"
@@ -104,6 +112,7 @@ jobs:
         working-directory: upstream/src-tauri
         run: |
           cargo fmt -- --check
+          cargo clippy --all-targets --all-features
           cargo test --lib test_tiered_flash_budget_and_client_effort -- --test-threads=1
           cargo test --lib test_tiered_effort_survives_second_pipeline_pass -- --test-threads=1
           cargo build --release --bin antigravity-tools
@@ -127,6 +136,7 @@ jobs:
 
   publish:
     needs: [discover, build]
+    if: ${{ !inputs.verify_existing }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
