@@ -1,0 +1,184 @@
+name: Tiered headless release
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tiered-headless-release
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.select.outputs.needed }}
+      version: ${{ steps.select.outputs.version }}
+      upstream_sha: ${{ steps.select.outputs.upstream_sha }}
+      patch_sha: ${{ steps.select.outputs.patch_sha }}
+      release_tag: ${{ steps.select.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select the latest stable upstream release
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(gh api repos/lbjlaq/Antigravity-Manager/releases/latest --jq .tag_name)
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Unexpected upstream stable tag: $version" >&2
+            exit 1
+          }
+          upstream_sha=$(git ls-remote https://github.com/lbjlaq/Antigravity-Manager.git "refs/tags/$version^{}" | awk 'NR == 1 { print $1 }')
+          if [[ -z "$upstream_sha" ]]; then
+            upstream_sha=$(git ls-remote https://github.com/lbjlaq/Antigravity-Manager.git "refs/tags/$version" | awk 'NR == 1 { print $1 }')
+          fi
+          [[ "$upstream_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          patch_sha=$(sha256sum .github/agm/tiered-effort.patch | cut -d' ' -f1)
+          release_tag="tiered-${version}-${patch_sha:0:12}"
+          status=$(curl -sS -o /tmp/tiered-release.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag")
+          case "$status" in
+            200) needed=false ;;
+            404) needed=true ;;
+            *) echo "Release lookup failed: HTTP $status" >&2; exit 1 ;;
+          esac
+          {
+            echo "needed=$needed"
+            echo "version=$version"
+            echo "upstream_sha=$upstream_sha"
+            echo "patch_sha=$patch_sha"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.needed == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fork
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lbjlaq/Antigravity-Manager
+          ref: ${{ needs.discover.outputs.upstream_sha }}
+          path: upstream
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake curl file git golang-go libayatana-appindicator3-dev \
+            libclang-dev libgtk-3-dev libjavascriptcoregtk-4.1-dev libnm-dev librsvg2-dev \
+            libsoup-3.0-dev libssl-dev libwebkit2gtk-4.1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream/src-tauri
+      - name: Apply and verify the tiered mapping
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = '${{ needs.discover.outputs.upstream_sha }}'
+          test "$(sha256sum fork/.github/agm/tiered-effort.patch | cut -d' ' -f1)" = '${{ needs.discover.outputs.patch_sha }}'
+          git -C upstream apply --check ../fork/.github/agm/tiered-effort.patch
+          git -C upstream apply ../fork/.github/agm/tiered-effort.patch
+          mkdir -p upstream/dist
+          printf '<html></html>\n' > upstream/dist/index.html
+          git -C upstream add -A src-tauri
+          mkdir -p release
+          source_tree=$(git -C upstream write-tree)
+          git -C upstream rev-parse "$source_tree:src-tauri" > release/src-tauri-tree.txt
+      - name: Run the mapping tests and build headless binary
+        working-directory: upstream/src-tauri
+        run: |
+          cargo fmt -- --check
+          cargo test --lib test_tiered_flash_budget_and_client_effort -- --test-threads=1
+          cargo test --lib test_tiered_effort_survives_second_pipeline_pass -- --test-threads=1
+          cargo build --release --bin antigravity-tools
+      - name: Create verified build manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp upstream/src-tauri/target/release/antigravity-tools release/antigravity-tools
+          binary_sha=$(sha256sum release/antigravity-tools | cut -d' ' -f1)
+          jq -n --arg version '${{ needs.discover.outputs.version }}' \
+            --arg binary_sha "$binary_sha" \
+            --arg patch_sha '${{ needs.discover.outputs.patch_sha }}' \
+            '{version:$version,binary_sha256:$binary_sha,patch_sha256:$patch_sha}' \
+            > release/manifest.json
+          (cd release && sha256sum antigravity-tools manifest.json > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tiered-headless
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    needs: [discover, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: tiered-headless
+          path: ${{ runner.temp }}/tiered-headless
+      - name: Verify the artifact and update the maintained branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIR: ${{ runner.temp }}/tiered-headless
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RELEASE_DIR"
+          sha256sum -c SHA256SUMS
+          cd "$GITHUB_WORKSPACE"
+          test "$(jq -r .version "$RELEASE_DIR/manifest.json")" = '${{ needs.discover.outputs.version }}'
+          test "$(jq -r .binary_sha256 "$RELEASE_DIR/manifest.json")" = "$(sha256sum "$RELEASE_DIR/antigravity-tools" | cut -d' ' -f1)"
+          test "$(jq -r .patch_sha256 "$RELEASE_DIR/manifest.json")" = "$(sha256sum .github/agm/tiered-effort.patch | cut -d' ' -f1)"
+          test "$(jq -r .patch_sha256 "$RELEASE_DIR/manifest.json")" = '${{ needs.discover.outputs.patch_sha }}'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags https://github.com/lbjlaq/Antigravity-Manager.git '${{ needs.discover.outputs.upstream_sha }}'
+          test "$(git rev-parse FETCH_HEAD)" = '${{ needs.discover.outputs.upstream_sha }}'
+          git merge --no-ff --no-commit FETCH_HEAD
+          git restore --source=HEAD --staged --worktree -- .github/workflows
+          git apply --check .github/agm/tiered-effort.patch
+          git apply .github/agm/tiered-effort.patch
+          git add -A
+          git diff --cached --check
+          source_tree=$(git write-tree)
+          test "$(git rev-parse "$source_tree:src-tauri")" = "$(cat "$RELEASE_DIR/src-tauri-tree.txt")"
+          git diff --quiet HEAD -- .github/workflows
+          git commit -m "feat(tiered): map five effort levels on ${{ needs.discover.outputs.version }}"
+          git push --force-with-lease origin HEAD:refs/heads/custom/tiered-effort
+          commit=$(git rev-parse HEAD)
+          cat > release-notes.md <<EOF
+          Custom headless build of upstream ${{ needs.discover.outputs.version }} (${{ needs.discover.outputs.upstream_sha }}).
+
+          Tiered Flash budgets: low 1000, medium 10000, high 32768, xhigh 49152, max 65535.
+          Patch SHA-256: ${{ needs.discover.outputs.patch_sha }}.
+          Source commit: $commit.
+
+          The two focused mapping tests and release compilation passed. Install through the relay maintenance gate after verifying manifest.json and the binary checksum.
+          EOF
+          gh release create '${{ needs.discover.outputs.release_tag }}' \
+            "$RELEASE_DIR/antigravity-tools" "$RELEASE_DIR/manifest.json" "$RELEASE_DIR/SHA256SUMS" \
+            --repo "$GITHUB_REPOSITORY" --target "$commit" \
+            --title '${{ needs.discover.outputs.release_tag }}' \
+            --notes-file release-notes.md --latest

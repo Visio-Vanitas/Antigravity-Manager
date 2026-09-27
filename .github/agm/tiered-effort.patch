@@ -1,0 +1,213 @@
+diff --git a/src-tauri/src/proxy/handlers/claude.rs b/src-tauri/src/proxy/handlers/claude.rs
+index 67d00a6..6dfc008 100644
+--- a/src-tauri/src/proxy/handlers/claude.rs
++++ b/src-tauri/src/proxy/handlers/claude.rs
+@@ -562,7 +562,14 @@ pub async fn handle_messages(
+     let effort_tier =
+         crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
+     let canonical_model = request.model.clone();
+-    if let Some(spec) = apply_variant(&mut request, effort_tier, effective_budget_hint) {
++    // Preserve the five distinct effort values for tiered Flash. VariantTier
++    // only has Low/Medium/High and would collapse xhigh/max into high.
++    let variant = if model_lower.ends_with("-tiered") {
++        None
++    } else {
++        apply_variant(&mut request, effort_tier, effective_budget_hint)
++    };
++    if let Some(spec) = variant {
+         if is_client_control && client_disabled {
+             request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+                 type_: "disabled".to_string(),
+diff --git a/src-tauri/src/proxy/mappers/gemini/wrapper.rs b/src-tauri/src/proxy/mappers/gemini/wrapper.rs
+index 85ca327..bf9f975 100644
+--- a/src-tauri/src/proxy/mappers/gemini/wrapper.rs
++++ b/src-tauri/src/proxy/mappers/gemini/wrapper.rs
+@@ -681,6 +681,8 @@ pub fn wrap_request_v2(
+                     client_level
+                 );
+                 tc.remove("thinkingLevel");
++                // Internal effort marker is only for the second pipeline pass.
++                tc.remove("effort");
+             }
+         }
+ 
+@@ -732,7 +734,16 @@ pub fn wrap_request_v2(
+     // [NEW] 按模型对 maxOutputTokens 进行三层限额 (Dynamic > Static Default > 65535)
+     // 修复: gemini-cli 等客户端发送的 131072 超过部分模型支持的上限，导致 v1internal 返回 400 INVALID_ARGUMENT
+     {
+-        let final_cap = crate::proxy::model_specs::get_max_output_tokens(final_model_name, token);
++        let mut final_cap =
++            crate::proxy::model_specs::get_max_output_tokens(final_model_name, token);
++        // max tiered effort uses thinkingBudget=65535. Google requires
++        // maxOutputTokens to be strictly larger, so retain 65536 after capping.
++        if crate::proxy::model_specs::is_tiered_flash_model(final_model_name)
++            && inner_request["generationConfig"]["thinkingConfig"]["thinkingBudget"].as_u64()
++                == Some(65535)
++        {
++            final_cap = final_cap.max(65536);
++        }
+         let gen_config = inner_request
+             .as_object_mut()
+             .unwrap()
+diff --git a/src-tauri/src/proxy/model_specs.rs b/src-tauri/src/proxy/model_specs.rs
+index 2f3e98d..918ebf4 100644
+--- a/src-tauri/src/proxy/model_specs.rs
++++ b/src-tauri/src/proxy/model_specs.rs
+@@ -497,6 +497,21 @@ pub fn resolve_custom_budget(
+             // 支持客户端接收无后缀的思考参数（low / medium / high）来切换档位（忽略客户端数字 budget），
+             // 分别对应网关在思考板块中配置的 flash_low, flash_medium, flash_high。
+             // 思考参数在没选择客户端回传模式（Gateway模式）下，统一只给 tiered 模型操控！
++            // Claude Code's five effort levels use fixed budgets on tiered
++            // Flash. Ignore the client's numeric budget and the three-level
++            // gateway knobs; they cannot represent xhigh and max.
++            let fixed_budget =
++                client_effort.and_then(|effort| match effort.trim().to_lowercase().as_str() {
++                    "low" | "extra-low" => Some(1000),
++                    "medium" | "default" => Some(10000),
++                    "high" => Some(32768),
++                    "xhigh" => Some(49152),
++                    "max" => Some(65535),
++                    _ => None,
++                });
++            if fixed_budget.is_some() {
++                return fixed_budget;
++            }
+             let client_level = client_effort.and_then(normalize_client_thinking_level);
+             if let Some(level) = client_level {
+                 match level {
+@@ -813,7 +828,7 @@ mod tests {
+             None
+         );
+ 
+-        // 3. 客户端传入思考参数 low / medium / high：分别映射到网关设置的 flash_low, flash_medium, flash_high
++        // 3. Tiered 客户端 effort 固定映射五档；客户端数字预算与网关三档设置均不覆盖
+         assert_eq!(
+             resolve_custom_budget(
+                 "gemini-3.7-flash-tiered",
+@@ -822,7 +837,7 @@ mod tests {
+                 &tb,
+                 None
+             ),
+-            Some(1024)
++            Some(1000)
+         );
+         assert_eq!(
+             resolve_custom_budget(
+@@ -832,15 +847,19 @@ mod tests {
+                 &tb,
+                 None
+             ),
+-            Some(1024)
++            Some(1000)
+         );
+         assert_eq!(
+             resolve_custom_budget("gemini-3.7-flash-tiered", Some("medium"), None, &tb, None),
+-            Some(4096)
++            Some(10000)
++        );
++        assert_eq!(
++            resolve_custom_budget("gemini-3.7-flash-tiered", Some("default"), None, &tb, None),
++            Some(10000)
+         );
+         assert_eq!(
+             resolve_custom_budget("gemini-3.7-flash-tiered", Some("high"), None, &tb, None),
+-            Some(16384)
++            Some(32768)
+         );
+         assert_eq!(
+             resolve_custom_budget(
+@@ -850,7 +869,11 @@ mod tests {
+                 &tb,
+                 None
+             ),
+-            Some(16384)
++            Some(65535)
++        );
++        assert_eq!(
++            resolve_custom_budget("gemini-3.7-flash-tiered", Some("xhigh"), None, &tb, None),
++            Some(49152)
+         );
+ 
+         // 4. 网关自定义 flash_tiered 为正数，且客户端无思考参数：返回自定义正数
+diff --git a/src-tauri/src/proxy/pipeline/inbound.rs b/src-tauri/src/proxy/pipeline/inbound.rs
+index 049f85a..5669a88 100644
+--- a/src-tauri/src/proxy/pipeline/inbound.rs
++++ b/src-tauri/src/proxy/pipeline/inbound.rs
+@@ -661,6 +661,18 @@ impl InboundThinkingPipeline {
+             });
+         }
+ 
++        // Keep the original tiered effort for the wrapper's second pipeline
++        // pass. The wrapper removes this internal field before upstream I/O.
++        if is_tiered {
++            if let Some(effort) = client_effort.map(str::trim) {
++                if matches!(
++                    effort,
++                    "low" | "extra-low" | "medium" | "default" | "high" | "xhigh" | "max"
++                ) {
++                    tc["effort"] = json!(effort);
++                }
++            }
++        }
+         generation_config["thinkingConfig"] = tc;
+ 
+         // 终审上限保护
+@@ -1268,6 +1280,58 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_tiered_effort_survives_second_pipeline_pass() {
++        use crate::proxy::config::{
++            update_thinking_budget_config, ThinkingBudgetConfig, ThinkingControlSource,
++        };
++
++        let mut config = ThinkingBudgetConfig::default();
++        config.control_source = ThinkingControlSource::Gateway;
++        update_thinking_budget_config(config);
++        struct ResetGuard;
++        impl Drop for ResetGuard {
++            fn drop(&mut self) {
++                crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig::default());
++            }
++        }
++        let _guard = ResetGuard;
++
++        for (effort, budget) in [
++            ("low", 1000),
++            ("medium", 10000),
++            ("high", 32768),
++            ("xhigh", 49152),
++            ("max", 65535),
++        ] {
++            let mut config = json!({"maxOutputTokens": 8192});
++            for _ in 0..2 {
++                let retained_effort = config
++                    .get("thinkingConfig")
++                    .and_then(|tc| tc.get("effort"))
++                    .and_then(|v| v.as_str())
++                    .unwrap_or(effort)
++                    .to_string();
++                assert_eq!(
++                    InboundThinkingPipeline::configure_inbound_thinking(
++                        "gemini-3.8-flash-tiered",
++                        &mut config,
++                        ClientThinkingSwitch::Enabled,
++                        Some(&retained_effort),
++                        Some(1024),
++                        None,
++                    ),
++                    Some(budget),
++                );
++            }
++            assert_eq!(config["thinkingConfig"]["thinkingBudget"], json!(budget));
++            assert_eq!(config["thinkingConfig"]["effort"], json!(effort));
++            if effort == "max" {
++                assert_eq!(config["maxOutputTokens"], json!(65536));
++            }
++        }
++    }
++
+     #[test]
+     fn test_configure_inbound_thinking_client_mode_routing_clean_isolation() {
+         use crate::proxy::config::{
