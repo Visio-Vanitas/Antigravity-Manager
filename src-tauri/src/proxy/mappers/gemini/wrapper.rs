@@ -687,6 +687,8 @@ pub fn wrap_request_v2(
                     client_level
                 );
                 tc.remove("thinkingLevel");
+                // Internal effort marker is only for the second pipeline pass.
+                tc.remove("effort");
             }
         }
 
@@ -738,7 +740,16 @@ pub fn wrap_request_v2(
     // [NEW] 按模型对 maxOutputTokens 进行三层限额 (Dynamic > Static Default > 65535)
     // 修复: gemini-cli 等客户端发送的 131072 超过部分模型支持的上限，导致 v1internal 返回 400 INVALID_ARGUMENT
     {
-        let final_cap = crate::proxy::model_specs::get_max_output_tokens(final_model_name, token);
+        let mut final_cap =
+            crate::proxy::model_specs::get_max_output_tokens(final_model_name, token);
+        // max tiered effort uses thinkingBudget=65535. Google requires
+        // maxOutputTokens to be strictly larger, so retain 65536 after capping.
+        if crate::proxy::model_specs::is_tiered_flash_model(final_model_name)
+            && inner_request["generationConfig"]["thinkingConfig"]["thinkingBudget"].as_u64()
+                == Some(65535)
+        {
+            final_cap = final_cap.max(65536);
+        }
         let gen_config = inner_request
             .as_object_mut()
             .unwrap()

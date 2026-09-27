@@ -562,7 +562,14 @@ pub async fn handle_messages(
     let effort_tier =
         crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
     let canonical_model = request.model.clone();
-    if let Some(spec) = apply_variant(&mut request, effort_tier, effective_budget_hint) {
+    // Preserve the five distinct effort values for tiered Flash. VariantTier
+    // only has Low/Medium/High and would collapse xhigh/max into high.
+    let variant = if model_lower.ends_with("-tiered") {
+        None
+    } else {
+        apply_variant(&mut request, effort_tier, effective_budget_hint)
+    };
+    if let Some(spec) = variant {
         if is_client_control && client_disabled {
             request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
                 type_: "disabled".to_string(),

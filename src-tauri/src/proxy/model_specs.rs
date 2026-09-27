@@ -497,6 +497,21 @@ pub fn resolve_custom_budget(
             // 支持客户端接收无后缀的思考参数（low / medium / high）来切换档位（忽略客户端数字 budget），
             // 分别对应网关在思考板块中配置的 flash_low, flash_medium, flash_high。
             // 思考参数在没选择客户端回传模式（Gateway模式）下，统一只给 tiered 模型操控！
+            // Claude Code's five effort levels use fixed budgets on tiered
+            // Flash. Ignore the client's numeric budget and the three-level
+            // gateway knobs; they cannot represent xhigh and max.
+            let fixed_budget =
+                client_effort.and_then(|effort| match effort.trim().to_lowercase().as_str() {
+                    "low" | "extra-low" => Some(1000),
+                    "medium" | "default" => Some(10000),
+                    "high" => Some(32768),
+                    "xhigh" => Some(49152),
+                    "max" => Some(65535),
+                    _ => None,
+                });
+            if fixed_budget.is_some() {
+                return fixed_budget;
+            }
             let client_level = client_effort.and_then(normalize_client_thinking_level);
             if let Some(level) = client_level {
                 match level {
@@ -813,7 +828,7 @@ mod tests {
             None
         );
 
-        // 3. 客户端传入思考参数 low / medium / high：分别映射到网关设置的 flash_low, flash_medium, flash_high
+        // 3. Tiered 客户端 effort 固定映射五档；客户端数字预算与网关三档设置均不覆盖
         assert_eq!(
             resolve_custom_budget(
                 "gemini-3.7-flash-tiered",
@@ -822,7 +837,7 @@ mod tests {
                 &tb,
                 None
             ),
-            Some(1024)
+            Some(1000)
         );
         assert_eq!(
             resolve_custom_budget(
@@ -832,15 +847,19 @@ mod tests {
                 &tb,
                 None
             ),
-            Some(1024)
+            Some(1000)
         );
         assert_eq!(
             resolve_custom_budget("gemini-3.7-flash-tiered", Some("medium"), None, &tb, None),
-            Some(4096)
+            Some(10000)
+        );
+        assert_eq!(
+            resolve_custom_budget("gemini-3.7-flash-tiered", Some("default"), None, &tb, None),
+            Some(10000)
         );
         assert_eq!(
             resolve_custom_budget("gemini-3.7-flash-tiered", Some("high"), None, &tb, None),
-            Some(16384)
+            Some(32768)
         );
         assert_eq!(
             resolve_custom_budget(
@@ -850,7 +869,11 @@ mod tests {
                 &tb,
                 None
             ),
-            Some(16384)
+            Some(65535)
+        );
+        assert_eq!(
+            resolve_custom_budget("gemini-3.7-flash-tiered", Some("xhigh"), None, &tb, None),
+            Some(49152)
         );
 
         // 4. 网关自定义 flash_tiered 为正数，且客户端无思考参数：返回自定义正数

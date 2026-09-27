@@ -743,6 +743,18 @@ impl InboundThinkingPipeline {
             });
         }
 
+        // Keep the original tiered effort for the wrapper's second pipeline
+        // pass. The wrapper removes this internal field before upstream I/O.
+        if is_tiered {
+            if let Some(effort) = client_effort.map(str::trim) {
+                if matches!(
+                    effort,
+                    "low" | "extra-low" | "medium" | "default" | "high" | "xhigh" | "max"
+                ) {
+                    tc["effort"] = json!(effort);
+                }
+            }
+        }
         generation_config["thinkingConfig"] = tc;
 
         // 终审上限保护
@@ -1348,6 +1360,58 @@ mod tests {
             extract_client_thinking_switch(None, None, Some("default")),
             ClientThinkingSwitch::Default
         );
+    }
+
+    #[test]
+    fn test_tiered_effort_survives_second_pipeline_pass() {
+        use crate::proxy::config::{
+            update_thinking_budget_config, ThinkingBudgetConfig, ThinkingControlSource,
+        };
+
+        let mut config = ThinkingBudgetConfig::default();
+        config.control_source = ThinkingControlSource::Gateway;
+        update_thinking_budget_config(config);
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig::default());
+            }
+        }
+        let _guard = ResetGuard;
+
+        for (effort, budget) in [
+            ("low", 1000),
+            ("medium", 10000),
+            ("high", 32768),
+            ("xhigh", 49152),
+            ("max", 65535),
+        ] {
+            let mut config = json!({"maxOutputTokens": 8192});
+            for _ in 0..2 {
+                let retained_effort = config
+                    .get("thinkingConfig")
+                    .and_then(|tc| tc.get("effort"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(effort)
+                    .to_string();
+                assert_eq!(
+                    InboundThinkingPipeline::configure_inbound_thinking(
+                        "gemini-3.8-flash-tiered",
+                        &mut config,
+                        ClientThinkingSwitch::Enabled,
+                        Some(&retained_effort),
+                        Some(1024),
+                        None,
+                    ),
+                    Some(budget),
+                );
+            }
+            assert_eq!(config["thinkingConfig"]["thinkingBudget"], json!(budget));
+            assert_eq!(config["thinkingConfig"]["effort"], json!(effort));
+            if effort == "max" {
+                assert_eq!(config["maxOutputTokens"], json!(65536));
+            }
+        }
     }
 
     #[test]
