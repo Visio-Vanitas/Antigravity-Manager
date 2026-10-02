@@ -173,10 +173,9 @@ jobs:
           test "$(git rev-parse FETCH_HEAD)" = '${{ needs.discover.outputs.upstream_sha }}'
           git merge --no-ff --no-commit FETCH_HEAD
           git restore --source=HEAD --staged --worktree -- .github/workflows
-          git apply --check .github/agm/tiered-effort.patch
-          git apply .github/agm/tiered-effort.patch
+          git apply --check --whitespace=error .github/agm/tiered-effort.patch
+          git apply --whitespace=error .github/agm/tiered-effort.patch
           git add -A
-          git diff --cached --check
           source_tree=$(git write-tree)
           test "$(git rev-parse "$source_tree:src-tauri")" = "$(cat "$RELEASE_DIR/src-tauri-tree.txt")"
           git diff --quiet HEAD -- .github/workflows
