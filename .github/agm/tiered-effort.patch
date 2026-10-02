@@ -226,3 +226,65 @@ index 072a31cb4d204ed68b2dbdd3a1986583130f53bf..dc0758a9eb464c4be71bccb8d290004b
      #[test]
      fn test_configure_inbound_thinking_client_mode_routing_clean_isolation() {
          use crate::proxy::config::{
+diff --git a/src-tauri/src/proxy/mappers/claude/request.rs b/src-tauri/src/proxy/mappers/claude/request.rs
+--- a/src-tauri/src/proxy/mappers/claude/request.rs
++++ b/src-tauri/src/proxy/mappers/claude/request.rs
+@@ -763,6 +763,24 @@
+         &config.final_model,
+         Some(&request_id),
+     );
++    // Tiered effort is an internal pipeline marker, not a Gemini wire field.
++    // Claude Messages reaches this mapper directly, so strip the marker after
++    // the final thinking normalization and before serializing the upstream body.
++    for generation_config_key in ["generationConfig", "generation_config"] {
++        if let Some(generation_config) = inner_request
++            .get_mut(generation_config_key)
++            .and_then(Value::as_object_mut)
++        {
++            for thinking_config_key in ["thinkingConfig", "thinking_config"] {
++                if let Some(thinking_config) = generation_config
++                    .get_mut(thinking_config_key)
++                    .and_then(Value::as_object_mut)
++                {
++                    thinking_config.remove("effort");
++                }
++            }
++        }
++    }
+     let reordered_inner = inner_request;
+ 
+     // [NEW] 动态检测是否需要标记为 agent 请求
+@@ -3592,6 +3610,33 @@
+     }
+ 
+     #[test]
++    fn test_claude_tiered_effort_maps_budget_without_leaking_effort_field() {
++        for (effort, budget) in [
++            ("low", 1000),
++            ("medium", 10000),
++            ("high", 32768),
++            ("xhigh", 49152),
++            ("max", 65535),
++        ] {
++            let req: ClaudeRequest = serde_json::from_value(json!({
++                "model": "gemini-3.8-flash-tiered",
++                "messages": [{"role": "user", "content": "Reply OK"}],
++                "max_tokens": 4096,
++                "output_config": {"effort": effort}
++            }))
++            .expect("Claude request should deserialize");
++
++            let result =
++                transform_claude_request_in(&req, "test-proj", false, None, "test-session", None)
++                    .expect("Claude request should transform");
++
++            let thinking_config = &result["request"]["generationConfig"]["thinkingConfig"];
++            assert_eq!(thinking_config["thinkingBudget"], budget, "{effort}");
++            assert!(thinking_config.get("effort").is_none(), "{effort}");
++        }
++    }
++
++    #[test]
+     fn test_gemini_client_billing_metadata_filtering() {
+         // [Issue #3452] Standalone billing header line should be filtered for Gemini targets
+         assert!(is_gemini_client_billing_metadata(
