@@ -118,8 +118,7 @@ jobs:
         run: |
           cargo fmt -- --check
           cargo clippy --all-targets --all-features
-          cargo test --lib test_tiered_flash_budget_and_client_effort -- --test-threads=1
-          cargo test --lib test_tiered_effort_survives_second_pipeline_pass -- --test-threads=1
+          cargo test --lib tiered_ -- --test-threads=1
           cargo build --release --bin antigravity-tools
       - name: Create verified build manifest
         shell: bash
@@ -189,7 +188,7 @@ jobs:
           Patch SHA-256: ${{ needs.discover.outputs.patch_sha }}.
           Source commit: $commit.
 
-          The two focused mapping tests and release compilation passed. Install through the relay maintenance gate after verifying manifest.json and the binary checksum.
+          The focused tiered mapping, repeated-pipeline, Claude Messages and Gemini wire tests and release compilation passed. Install through the relay maintenance gate after verifying manifest.json and the binary checksum.
           EOF
           gh release create '${{ needs.discover.outputs.release_tag }}' \
             "$RELEASE_DIR/antigravity-tools" "$RELEASE_DIR/manifest.json" "$RELEASE_DIR/SHA256SUMS" \

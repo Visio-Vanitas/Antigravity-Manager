@@ -1,8 +1,8 @@
 diff --git a/src-tauri/src/proxy/handlers/claude.rs b/src-tauri/src/proxy/handlers/claude.rs
-index 617d0395b27cf902343389761823637a7c4b87e3..30bef03d23e2606c27a037d1e9f7073dfb6bd099 100644
+index c63505e..5ff9826 100644
 --- a/src-tauri/src/proxy/handlers/claude.rs
 +++ b/src-tauri/src/proxy/handlers/claude.rs
-@@ -565,7 +565,12 @@ pub async fn handle_messages(
+@@ -922,7 +922,12 @@ pub async fn handle_messages(
      let effort_tier =
          crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
      let canonical_model = request.model.clone();
@@ -16,27 +16,127 @@ index 617d0395b27cf902343389761823637a7c4b87e3..30bef03d23e2606c27a037d1e9f7073d
          if is_client_control && client_disabled {
              request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
                  type_: "disabled".to_string(),
+diff --git a/src-tauri/src/proxy/mappers/claude/request.rs b/src-tauri/src/proxy/mappers/claude/request.rs
+index f9a84b4..bbfa576 100644
+--- a/src-tauri/src/proxy/mappers/claude/request.rs
++++ b/src-tauri/src/proxy/mappers/claude/request.rs
+@@ -763,6 +763,24 @@ pub fn transform_claude_request_in_timed(
+         &config.final_model,
+         Some(&request_id),
+     );
++    // Tiered effort is an internal pipeline marker, not a Gemini wire field.
++    // Claude Messages reaches this mapper directly, so strip the marker after
++    // the final thinking normalization and before serializing the upstream body.
++    for generation_config_key in ["generationConfig", "generation_config"] {
++        if let Some(generation_config) = inner_request
++            .get_mut(generation_config_key)
++            .and_then(Value::as_object_mut)
++        {
++            for thinking_config_key in ["thinkingConfig", "thinking_config"] {
++                if let Some(thinking_config) = generation_config
++                    .get_mut(thinking_config_key)
++                    .and_then(Value::as_object_mut)
++                {
++                    thinking_config.remove("effort");
++                }
++            }
++        }
++    }
+     let reordered_inner = inner_request;
+ 
+     // [NEW] 动态检测是否需要标记为 agent 请求
+@@ -3591,6 +3609,37 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_claude_tiered_effort_maps_budget_without_leaking_effort_field() {
++        for (effort, budget) in [
++            ("low", 1000),
++            ("medium", 10000),
++            ("high", 32768),
++            ("xhigh", 49152),
++            ("max", 65535),
++        ] {
++            let req: ClaudeRequest = serde_json::from_value(json!({
++                "model": "gemini-3.8-flash-tiered",
++                "messages": [{"role": "user", "content": "Reply OK"}],
++                "max_tokens": 4096,
++                "output_config": {"effort": effort}
++            }))
++            .expect("Claude request should deserialize");
++
++            let result =
++                transform_claude_request_in(&req, "test-proj", false, None, "test-session", None)
++                    .expect("Claude request should transform");
++
++            let thinking_config = &result["request"]["generationConfig"]["thinkingConfig"];
++            assert_eq!(thinking_config["thinkingBudget"], budget, "{effort}");
++            assert!(thinking_config.get("effort").is_none(), "{effort}");
++            let max_output = result["request"]["generationConfig"]["maxOutputTokens"]
++                .as_i64()
++                .unwrap();
++            assert!(max_output > budget && max_output <= 65536, "{effort}");
++        }
++    }
++
+     #[test]
+     fn test_gemini_client_billing_metadata_filtering() {
+         // [Issue #3452] Standalone billing header line should be filtered for Gemini targets
 diff --git a/src-tauri/src/proxy/mappers/gemini/wrapper.rs b/src-tauri/src/proxy/mappers/gemini/wrapper.rs
-index e8c790688d4d4c8268b308fa37ac9d863b436baf..319e1c416a0d7241dcbea11b5dd8178a14715f78 100644
+index 35530e5..a6c6090 100644
 --- a/src-tauri/src/proxy/mappers/gemini/wrapper.rs
 +++ b/src-tauri/src/proxy/mappers/gemini/wrapper.rs
-@@ -553,7 +553,14 @@ pub fn wrap_request_v2(
+@@ -553,7 +553,21 @@ pub fn wrap_request_v2(
      // [NEW] 按模型对 maxOutputTokens 进行三层限额 (Dynamic > Static Default > 65535)
      // 修复: gemini-cli 等客户端发送的 131072 超过部分模型支持的上限，导致 v1internal 返回 400 INVALID_ARGUMENT
      {
 -        let final_cap = crate::proxy::model_specs::get_max_output_tokens(final_model_name, token);
++        let fixed_tiered_budget = inner_request["generationConfig"]["thinkingConfig"]
++            .get("effort")
++            .and_then(Value::as_str)
++            .and_then(crate::proxy::model_specs::tiered_effort_budget)
++            .filter(|budget| {
++                crate::proxy::model_specs::is_tiered_flash_model(final_model_name)
++                    && inner_request["generationConfig"]["thinkingConfig"]["thinkingBudget"]
++                        .as_i64()
++                        == Some(*budget)
++            });
 +        let mut final_cap =
 +            crate::proxy::model_specs::get_max_output_tokens(final_model_name, token);
-+        if crate::proxy::model_specs::is_tiered_flash_model(final_model_name)
-+            && inner_request["generationConfig"]["thinkingConfig"]["thinkingBudget"].as_u64()
-+                == Some(65535)
-+        {
++        if fixed_tiered_budget.is_some() {
 +            final_cap = final_cap.max(65536);
 +        }
          let gen_config = inner_request
              .as_object_mut()
              .unwrap()
-@@ -850,6 +857,21 @@ pub fn wrap_request_v2(
+@@ -590,7 +604,7 @@ pub fn wrap_request_v2(
+                 // 证明用户/客户端强烈希望短平快直接回答，不希望被高思考拖慢！
+                 // 此时压缩思考预算为 max(0, m - 1024)。若 m <= 1024 则预算为 0！
+                 if let Some(user_m) = user_provided_max {
+-                    if budget as u64 >= 6 * user_m {
++                    if fixed_tiered_budget.is_none() && budget as u64 >= 6 * user_m {
+                         let fast_budget = if user_m > 1024 {
+                             (user_m - 1024) as i64
+                         } else {
+@@ -607,9 +621,14 @@ pub fn wrap_request_v2(
+                 // 如果未触发 6 倍极速压缩 (或者极速压缩后仍然有非零思考预算)：
+                 if final_budget > 0 {
+                     // 【分支 2: 常规深度推理 - 官方容量能包住时优先自动扩充 m】
+-                    if final_budget as u64 + 1024 <= final_cap {
++                    let output_headroom = if fixed_tiered_budget.is_some() {
++                        1
++                    } else {
++                        1024
++                    };
++                    if final_budget as u64 + output_headroom <= final_cap {
+                         if final_max <= final_budget as u64 {
+-                            final_max = final_budget as u64 + 1024;
++                            final_max = final_budget as u64 + output_headroom;
+                             tracing::info!(
+                                 "[Gemini-Wrap] Auto-expanded maxOutputTokens to {} to preserve thinkingBudget ({}) within official final_cap ({}) for model {}",
+                                 final_max, final_budget, final_cap, final_model_name
+@@ -923,6 +942,21 @@ pub fn wrap_request_v2(
          &config.final_model,
          Some(&official_request_id),
      );
@@ -58,57 +158,129 @@ index e8c790688d4d4c8268b308fa37ac9d863b436baf..319e1c416a0d7241dcbea11b5dd8178a
      let reordered_inner = inner_request;
  
      let mut final_request_obj = json!({
-@@ -1249,6 +1271,26 @@ mod tests {
+@@ -1322,6 +1356,61 @@ mod tests {
          assert!(result["requestId"].as_str().unwrap().starts_with("agent/"));
      }
  
 +    #[test]
 +    fn test_tiered_effort_marker_is_removed_before_upstream_request() {
-+        let body = json!({
-+            "model": "gemini-3.8-flash-tiered",
-+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
-+            "generation_config": {
-+                "thinking_config": {"effort": "max", "thinking_budget": 65535}
++        for (effort, budget) in [
++            ("low", 1000),
++            ("medium", 10000),
++            ("high", 32768),
++            ("xhigh", 49152),
++            ("max", 65535),
++        ] {
++            for snake_case in [false, true] {
++                let generation_config = if snake_case {
++                    json!({
++                        "max_output_tokens": 1024,
++                        "thinking_config": {"effort": effort, "thinking_budget": budget}
++                    })
++                } else {
++                    json!({
++                        "maxOutputTokens": 1024,
++                        "thinkingConfig": {"effort": effort, "thinkingBudget": budget}
++                    })
++                };
++                let mut body = json!({
++                    "model": "gemini-3.8-flash-tiered",
++                    "contents": [{"role": "user", "parts": [{"text": "Hi"}]}]
++                });
++                body[if snake_case {
++                    "generation_config"
++                } else {
++                    "generationConfig"
++                }] = generation_config;
++                let result = wrap_request(
++                    &body,
++                    "test-project",
++                    "gemini-3.8-flash-tiered",
++                    None,
++                    None,
++                    None,
++                );
++                // Gemini wire requests use camelCase. Legacy snake_case still
++                // must not leak the internal marker; budget mapping is checked
++                // on the canonical wire representation.
++                if !snake_case {
++                    let gen_config = &result["request"]["generationConfig"];
++                    assert_eq!(
++                        gen_config["thinkingConfig"]["thinkingBudget"], budget,
++                        "{effort}"
++                    );
++                    let max_output = gen_config["maxOutputTokens"].as_i64().unwrap();
++                    assert!(max_output > budget && max_output <= 65536, "{effort}");
++                }
++                assert!(!result["request"].to_string().contains("\"effort\""));
 +            }
-+        });
-+        let result = wrap_request(
-+            &body,
-+            "test-project",
-+            "gemini-3.8-flash-tiered",
-+            None,
-+            None,
-+            None,
-+        );
-+        assert!(!result["request"].to_string().contains("\"effort\""));
++        }
 +    }
 +
      #[test]
      fn test_unwrap_response() {
          let wrapped = json!({
+diff --git a/src-tauri/src/proxy/mappers/openai/request.rs b/src-tauri/src/proxy/mappers/openai/request.rs
+index bbd3850..368543e 100644
+--- a/src-tauri/src/proxy/mappers/openai/request.rs
++++ b/src-tauri/src/proxy/mappers/openai/request.rs
+@@ -1519,7 +1519,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn tiered_flash_ignores_client_effort_and_keeps_include_thoughts_only() {
++    fn tiered_flash_maps_client_effort_to_fixed_budget() {
+         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
+             .lock()
+             .unwrap_or_else(|e| e.into_inner());
+@@ -1529,9 +1529,10 @@ mod tests {
+             for (effort, expected_budget) in [
+                 (None, -1),
+                 (Some("low"), 1000),
+-                (Some("medium"), 4000),
+-                (Some("high"), -1),
+-                (Some("xhigh"), -1),
++                (Some("medium"), 10000),
++                (Some("high"), 32768),
++                (Some("xhigh"), 49152),
++                (Some("max"), 65535),
+             ] {
+                 let body = tiered_request_body(model, effort);
+                 let thinking = &body["request"]["generationConfig"]["thinkingConfig"];
 diff --git a/src-tauri/src/proxy/model_specs.rs b/src-tauri/src/proxy/model_specs.rs
-index 35220cf81b1c2a4b52eefe452ec21d445e17aeec..8063355744611a0c6a82e04ea4d785f8c3832ebf 100644
+index 4dd7b46..e554305 100644
 --- a/src-tauri/src/proxy/model_specs.rs
 +++ b/src-tauri/src/proxy/model_specs.rs
-@@ -592,6 +592,18 @@ pub fn resolve_custom_budget(
+@@ -597,6 +597,18 @@ pub fn normalize_client_thinking_level(effort: &str) -> Option<&'static str> {
+     }
+ }
+ 
++/// Fixed budgets for the maintained tiered Flash effort mapping.
++pub fn tiered_effort_budget(effort: &str) -> Option<i64> {
++    match effort.trim().to_ascii_lowercase().as_str() {
++        "low" | "extra-low" => Some(1000),
++        "medium" | "default" => Some(10000),
++        "high" => Some(32768),
++        "xhigh" => Some(49152),
++        "max" => Some(65535),
++        _ => None,
++    }
++}
++
+ /// 解析权威思考链 Token 预算
+ /// - Some(budget): 表示需要向上游注入具体数值的 thinkingBudget
+ /// - None: 表示不注入 thinkingBudget，仅开启 includeThoughts（官方自适应模式，或配置为 -1 的自适应档位）
+@@ -758,6 +770,9 @@ pub fn resolve_custom_budget(
          if is_tiered_flash_model(&std_id) || lower.contains("tiered") {
              // [TIERED-THINKING] Tiered 自适应模型：
              // 不动模型名，严格按照 tiered 模型的 low / high / medium 的预算填写
-+            let fixed_budget =
-+                client_effort.and_then(|effort| match effort.trim().to_lowercase().as_str() {
-+                    "low" | "extra-low" => Some(1000),
-+                    "medium" | "default" => Some(10000),
-+                    "high" => Some(32768),
-+                    "xhigh" => Some(49152),
-+                    "max" => Some(65535),
-+                    _ => None,
-+                });
-+            if fixed_budget.is_some() {
-+                return fixed_budget;
++            if let Some(budget) = client_effort.and_then(tiered_effort_budget) {
++                return Some(budget);
 +            }
              let client_level = client_effort.and_then(normalize_client_thinking_level);
              if let Some(level) = client_level {
                  match level {
-@@ -923,7 +935,7 @@ mod tests {
+@@ -1098,7 +1113,7 @@ mod tests {
                  &tb,
                  None
              ),
@@ -117,7 +289,7 @@ index 35220cf81b1c2a4b52eefe452ec21d445e17aeec..8063355744611a0c6a82e04ea4d785f8
          );
          assert_eq!(
              resolve_custom_budget(
-@@ -933,15 +945,15 @@ mod tests {
+@@ -1108,15 +1123,15 @@ mod tests {
                  &tb,
                  None
              ),
@@ -136,7 +308,7 @@ index 35220cf81b1c2a4b52eefe452ec21d445e17aeec..8063355744611a0c6a82e04ea4d785f8
          );
          assert_eq!(
              resolve_custom_budget(
-@@ -951,7 +963,11 @@ mod tests {
+@@ -1126,7 +1141,11 @@ mod tests {
                  &tb,
                  None
              ),
@@ -150,27 +322,85 @@ index 35220cf81b1c2a4b52eefe452ec21d445e17aeec..8063355744611a0c6a82e04ea4d785f8
  
          // 4. 网关自定义 flash_tiered 为正数，且客户端无思考参数：返回自定义正数
 diff --git a/src-tauri/src/proxy/pipeline/inbound.rs b/src-tauri/src/proxy/pipeline/inbound.rs
-index 072a31cb4d204ed68b2dbdd3a1986583130f53bf..dc0758a9eb464c4be71bccb8d290004ba8391d1d 100644
+index ff5129b..e4773c8 100644
 --- a/src-tauri/src/proxy/pipeline/inbound.rs
 +++ b/src-tauri/src/proxy/pipeline/inbound.rs
-@@ -1186,6 +1186,16 @@ impl InboundThinkingPipeline {
-                 });
-             } else {
-                 tc["thinkingBudget"] = json!(budget);
-+                if is_tiered {
-+                    if let Some(effort) = client_effort.map(str::trim) {
-+                        if matches!(
-+                            effort,
-+                            "low" | "extra-low" | "medium" | "default" | "high" | "xhigh" | "max"
-+                        ) {
-+                            tc["effort"] = json!(effort);
+@@ -1175,6 +1175,15 @@ impl InboundThinkingPipeline {
+                     });
+                 } else {
+                     tc["thinkingBudget"] = json!(budget);
++                    if is_tiered {
++                        if let Some(effort) = client_effort.map(str::trim) {
++                            if crate::proxy::model_specs::tiered_effort_budget(effort)
++                                == Some(budget)
++                            {
++                                tc["effort"] = json!(effort);
++                            }
 +                        }
 +                    }
-+                }
+                 }
+             } else if is_tiered {
+                 // Tiered 模型未指定具体数字 budget 且官方结构体无 thinking_budget 时：纯自适应模式
+@@ -1186,6 +1195,19 @@ impl InboundThinkingPipeline {
+             generation_config["thinkingConfig"] = tc;
+         }
  
-                 // 确保 maxOutputTokens 大于 thinkingBudget 避免 400 (仅当 budget > 0 时)
-                 if budget > 0 {
-@@ -2251,6 +2261,55 @@ mod tests {
++        // The internal marker survives repeated pipeline passes. Explicit tiered
++        // effort is authoritative; short-output heuristics must not change it.
++        let fixed_tiered_budget = generation_config
++            .get("thinkingConfig")
++            .and_then(|tc| tc.get("effort"))
++            .and_then(Value::as_str)
++            .and_then(crate::proxy::model_specs::tiered_effort_budget)
++            .filter(|budget| {
++                crate::proxy::model_specs::is_tiered_flash_model(target_model)
++                    && generation_config["thinkingConfig"]["thinkingBudget"].as_i64()
++                        == Some(*budget)
++            });
++
+         // 终审上限保护与不变量协调状态机：
+         // 1. 获取官方模型结构体的物理最大输出硬顶 (safe_limit)
+         let safe_limit = official_info
+@@ -1204,6 +1226,12 @@ impl InboundThinkingPipeline {
+                 }
+             });
+ 
++        let safe_limit = if fixed_tiered_budget.is_some() {
++            safe_limit.max(65536)
++        } else {
++            safe_limit
++        };
++
+         // 客户端/用户当前传入的 maxOutputTokens（若缺省则默认按官方 safe_limit 填齐）
+         let user_provided_max = generation_config
+             .get("maxOutputTokens")
+@@ -1233,7 +1261,7 @@ impl InboundThinkingPipeline {
+                 // 证明用户/客户端强烈希望短平快直接回答，不希望被高思考拖慢！
+                 // 此时压缩思考预算为 max(0, m - 1024)。若 m <= 1024 则预算为 0！
+                 if let Some(user_m) = user_provided_max {
+-                    if budget >= 6 * user_m {
++                    if fixed_tiered_budget.is_none() && budget >= 6 * user_m {
+                         let fast_budget = if user_m > 1024 { user_m - 1024 } else { 0 };
+                         final_budget = fast_budget;
+                         tracing::info!(
+@@ -1247,9 +1275,14 @@ impl InboundThinkingPipeline {
+                 if final_budget > 0 {
+                     // 【分支 2: 常规深度推理 - 官方容量能包住时优先自动扩充 m】
+                     // 如果 final_budget + 1024 <= safe_limit：
+-                    if final_budget + 1024 <= safe_limit {
++                    let output_headroom = if fixed_tiered_budget.is_some() {
++                        1
++                    } else {
++                        1024
++                    };
++                    if final_budget + output_headroom <= safe_limit {
+                         if final_max <= final_budget {
+-                            final_max = final_budget + 1024;
++                            final_max = final_budget + output_headroom;
+                             tracing::info!(
+                                 "[Pipeline-Inbound] Auto-expanded maxOutputTokens from {} to {} to preserve thinkingBudget ({}) within official safe_limit ({})",
+                                 current_max, final_max, final_budget, safe_limit
+@@ -2345,6 +2378,57 @@ mod tests {
          );
      }
  
@@ -198,7 +428,7 @@ index 072a31cb4d204ed68b2dbdd3a1986583130f53bf..dc0758a9eb464c4be71bccb8d290004b
 +            ("xhigh", 49152),
 +            ("max", 65535),
 +        ] {
-+            let mut config = json!({"maxOutputTokens": 8192});
++            let mut config = json!({"maxOutputTokens": 1024});
 +            for _ in 0..2 {
 +                let retained_effort = config
 +                    .get("thinkingConfig")
@@ -220,71 +450,33 @@ index 072a31cb4d204ed68b2dbdd3a1986583130f53bf..dc0758a9eb464c4be71bccb8d290004b
 +            }
 +            assert_eq!(config["thinkingConfig"]["thinkingBudget"], json!(budget));
 +            assert_eq!(config["thinkingConfig"]["effort"], json!(effort));
++            let max_output = config["maxOutputTokens"].as_i64().unwrap();
++            assert!(max_output > budget && max_output <= 65536, "{effort}");
 +        }
 +    }
 +
      #[test]
      fn test_configure_inbound_thinking_client_mode_routing_clean_isolation() {
          use crate::proxy::config::{
-diff --git a/src-tauri/src/proxy/mappers/claude/request.rs b/src-tauri/src/proxy/mappers/claude/request.rs
---- a/src-tauri/src/proxy/mappers/claude/request.rs
-+++ b/src-tauri/src/proxy/mappers/claude/request.rs
-@@ -763,6 +763,24 @@
-         &config.final_model,
-         Some(&request_id),
-     );
-+    // Tiered effort is an internal pipeline marker, not a Gemini wire field.
-+    // Claude Messages reaches this mapper directly, so strip the marker after
-+    // the final thinking normalization and before serializing the upstream body.
-+    for generation_config_key in ["generationConfig", "generation_config"] {
-+        if let Some(generation_config) = inner_request
-+            .get_mut(generation_config_key)
-+            .and_then(Value::as_object_mut)
-+        {
-+            for thinking_config_key in ["thinkingConfig", "thinking_config"] {
-+                if let Some(thinking_config) = generation_config
-+                    .get_mut(thinking_config_key)
-+                    .and_then(Value::as_object_mut)
-+                {
-+                    thinking_config.remove("effort");
-+                }
-+            }
-+        }
-+    }
-     let reordered_inner = inner_request;
- 
-     // [NEW] 动态检测是否需要标记为 agent 请求
-@@ -3592,6 +3610,33 @@
-     }
- 
-     #[test]
-+    fn test_claude_tiered_effort_maps_budget_without_leaking_effort_field() {
-+        for (effort, budget) in [
-+            ("low", 1000),
-+            ("medium", 10000),
-+            ("high", 32768),
-+            ("xhigh", 49152),
-+            ("max", 65535),
-+        ] {
-+            let req: ClaudeRequest = serde_json::from_value(json!({
-+                "model": "gemini-3.8-flash-tiered",
-+                "messages": [{"role": "user", "content": "Reply OK"}],
-+                "max_tokens": 4096,
-+                "output_config": {"effort": effort}
-+            }))
-+            .expect("Claude request should deserialize");
-+
-+            let result =
-+                transform_claude_request_in(&req, "test-proj", false, None, "test-session", None)
-+                    .expect("Claude request should transform");
-+
-+            let thinking_config = &result["request"]["generationConfig"]["thinkingConfig"];
-+            assert_eq!(thinking_config["thinkingBudget"], budget, "{effort}");
-+            assert!(thinking_config.get("effort").is_none(), "{effort}");
-+        }
-+    }
-+
-+    #[test]
-     fn test_gemini_client_billing_metadata_filtering() {
-         // [Issue #3452] Standalone billing header line should be filtered for Gemini targets
-         assert!(is_gemini_client_billing_metadata(
+diff --git a/src-tauri/src/proxy/pipeline/official_alignment_tests.rs b/src-tauri/src/proxy/pipeline/official_alignment_tests.rs
+index 3a8ea55..02c0ae9 100644
+--- a/src-tauri/src/proxy/pipeline/official_alignment_tests.rs
++++ b/src-tauri/src/proxy/pipeline/official_alignment_tests.rs
+@@ -529,7 +529,7 @@ mod tests {
+                 &tb_default,
+                 None
+             ),
+-            Some(4000)
++            Some(10000)
+         );
+         assert_eq!(
+             resolve_custom_budget(
+@@ -539,7 +539,7 @@ mod tests {
+                 &tb_default,
+                 None
+             ),
+-            Some(-1)
++            Some(32768)
+         );
+         assert_eq!(
+             resolve_custom_budget("gemini-3.8-flash-tiered", None, None, &tb_default, None),
