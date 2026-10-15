@@ -221,7 +221,7 @@ index 35530e5..a6c6090 100644
      fn test_unwrap_response() {
          let wrapped = json!({
 diff --git a/src-tauri/src/proxy/mappers/openai/request.rs b/src-tauri/src/proxy/mappers/openai/request.rs
-index bbd3850..368543e 100644
+index bbd3850..e7fb97e 100644
 --- a/src-tauri/src/proxy/mappers/openai/request.rs
 +++ b/src-tauri/src/proxy/mappers/openai/request.rs
 @@ -1519,7 +1519,7 @@ mod tests {
@@ -247,6 +247,20 @@ index bbd3850..368543e 100644
              ] {
                  let body = tiered_request_body(model, effort);
                  let thinking = &body["request"]["generationConfig"]["thinkingConfig"];
+@@ -1540,6 +1541,13 @@ mod tests {
+                 assert_eq!(thinking["includeThoughts"], true);
+                 assert!(thinking.get("thinkingLevel").is_none());
+                 assert_eq!(thinking["thinkingBudget"], expected_budget);
++                assert!(thinking.get("effort").is_none());
++                if expected_budget > 0 {
++                    let max_output = body["request"]["generationConfig"]["maxOutputTokens"]
++                        .as_i64()
++                        .unwrap();
++                    assert!(max_output > expected_budget && max_output <= 65536);
++                }
+             }
+         }
+     }
 diff --git a/src-tauri/src/proxy/model_specs.rs b/src-tauri/src/proxy/model_specs.rs
 index 949d829..8e87c15 100644
 --- a/src-tauri/src/proxy/model_specs.rs
@@ -322,7 +336,7 @@ index 949d829..8e87c15 100644
  
          // 4. 网关自定义 flash_tiered 为正数，且客户端无思考参数：返回自定义正数
 diff --git a/src-tauri/src/proxy/pipeline/inbound.rs b/src-tauri/src/proxy/pipeline/inbound.rs
-index fa061b1..066f502 100644
+index fa061b1..adf50db 100644
 --- a/src-tauri/src/proxy/pipeline/inbound.rs
 +++ b/src-tauri/src/proxy/pipeline/inbound.rs
 @@ -1246,6 +1246,15 @@ impl InboundThinkingPipeline {
@@ -400,10 +414,62 @@ index fa061b1..066f502 100644
                              tracing::info!(
                                  "[Pipeline-Inbound] Auto-expanded maxOutputTokens from {} to {} to preserve thinkingBudget ({}) within official safe_limit ({})",
                                  current_max, final_max, final_budget, safe_limit
-@@ -2436,6 +2469,57 @@ mod tests {
+@@ -1796,6 +1829,26 @@ impl InboundThinkingPipeline {
+             return;
+         }
+ 
++        // Tiered effort is pipeline state, never a Google wire field. All four
++        // adapters and the upstream client share this final envelope boundary.
++        let payload = if body.get("request").is_some() {
++            &mut body["request"]
++        } else {
++            &mut *body
++        };
++        for generation_key in ["generationConfig", "generation_config"] {
++            if let Some(generation) = payload.get_mut(generation_key) {
++                for thinking_key in ["thinkingConfig", "thinking_config"] {
++                    if let Some(thinking) = generation
++                        .get_mut(thinking_key)
++                        .and_then(Value::as_object_mut)
++                    {
++                        thinking.remove("effort");
++                    }
++                }
++            }
++        }
++
+         let body_obj = match body.as_object_mut() {
+             Some(obj) => obj,
+             None => return,
+@@ -2436,6 +2489,82 @@ mod tests {
          );
      }
  
++    #[test]
++    fn test_tiered_effort_is_removed_at_final_envelope_boundary() {
++        for wrapped in [false, true] {
++            for snake_case in [false, true] {
++                let (generation_key, thinking_key, budget_key) = if snake_case {
++                    ("generation_config", "thinking_config", "thinking_budget")
++                } else {
++                    ("generationConfig", "thinkingConfig", "thinkingBudget")
++                };
++                let mut payload = json!({"contents": []});
++                payload[generation_key] = json!({});
++                payload[generation_key][thinking_key] = json!({"effort": "max"});
++                payload[generation_key][thinking_key][budget_key] = json!(65535);
++                let mut body = if wrapped {
++                    json!({"model": "gemini-3.8-flash-tiered", "request": payload})
++                } else {
++                    payload
++                };
++                InboundThinkingPipeline::align_official_envelope(&mut body);
++                assert!(!body.to_string().contains("\"effort\""));
++                assert!(body.to_string().contains("65535"));
++            }
++        }
++    }
++
 +    #[test]
 +    fn test_tiered_effort_survives_second_pipeline_pass() {
 +        use crate::proxy::config::{
