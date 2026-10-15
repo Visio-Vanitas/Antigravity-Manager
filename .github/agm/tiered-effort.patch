@@ -1,8 +1,8 @@
 diff --git a/src-tauri/src/proxy/handlers/claude.rs b/src-tauri/src/proxy/handlers/claude.rs
-index c63505e..5ff9826 100644
+index 1e38894..ebf38b1 100644
 --- a/src-tauri/src/proxy/handlers/claude.rs
 +++ b/src-tauri/src/proxy/handlers/claude.rs
-@@ -922,7 +922,12 @@ pub async fn handle_messages(
+@@ -1023,7 +1023,12 @@ pub async fn handle_messages(
      let effort_tier =
          crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
      let canonical_model = request.model.clone();
@@ -17,7 +17,7 @@ index c63505e..5ff9826 100644
              request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
                  type_: "disabled".to_string(),
 diff --git a/src-tauri/src/proxy/mappers/claude/request.rs b/src-tauri/src/proxy/mappers/claude/request.rs
-index f9a84b4..bbfa576 100644
+index e7d7945..f5a099a 100644
 --- a/src-tauri/src/proxy/mappers/claude/request.rs
 +++ b/src-tauri/src/proxy/mappers/claude/request.rs
 @@ -763,6 +763,24 @@ pub fn transform_claude_request_in_timed(
@@ -45,7 +45,7 @@ index f9a84b4..bbfa576 100644
      let reordered_inner = inner_request;
  
      // [NEW] 动态检测是否需要标记为 agent 请求
-@@ -3591,6 +3609,37 @@ mod tests {
+@@ -3588,6 +3606,37 @@ mod tests {
          );
      }
  
@@ -248,10 +248,10 @@ index bbd3850..368543e 100644
                  let body = tiered_request_body(model, effort);
                  let thinking = &body["request"]["generationConfig"]["thinkingConfig"];
 diff --git a/src-tauri/src/proxy/model_specs.rs b/src-tauri/src/proxy/model_specs.rs
-index 4dd7b46..e554305 100644
+index 949d829..8e87c15 100644
 --- a/src-tauri/src/proxy/model_specs.rs
 +++ b/src-tauri/src/proxy/model_specs.rs
-@@ -597,6 +597,18 @@ pub fn normalize_client_thinking_level(effort: &str) -> Option<&'static str> {
+@@ -636,6 +636,18 @@ pub fn normalize_client_thinking_level(effort: &str) -> Option<&'static str> {
      }
  }
  
@@ -270,7 +270,7 @@ index 4dd7b46..e554305 100644
  /// 解析权威思考链 Token 预算
  /// - Some(budget): 表示需要向上游注入具体数值的 thinkingBudget
  /// - None: 表示不注入 thinkingBudget，仅开启 includeThoughts（官方自适应模式，或配置为 -1 的自适应档位）
-@@ -758,6 +770,9 @@ pub fn resolve_custom_budget(
+@@ -797,6 +809,9 @@ pub fn resolve_custom_budget(
          if is_tiered_flash_model(&std_id) || lower.contains("tiered") {
              // [TIERED-THINKING] Tiered 自适应模型：
              // 不动模型名，严格按照 tiered 模型的 low / high / medium 的预算填写
@@ -280,7 +280,7 @@ index 4dd7b46..e554305 100644
              let client_level = client_effort.and_then(normalize_client_thinking_level);
              if let Some(level) = client_level {
                  match level {
-@@ -1098,7 +1113,7 @@ mod tests {
+@@ -1142,7 +1157,7 @@ mod tests {
                  &tb,
                  None
              ),
@@ -289,7 +289,7 @@ index 4dd7b46..e554305 100644
          );
          assert_eq!(
              resolve_custom_budget(
-@@ -1108,15 +1123,15 @@ mod tests {
+@@ -1152,15 +1167,15 @@ mod tests {
                  &tb,
                  None
              ),
@@ -308,7 +308,7 @@ index 4dd7b46..e554305 100644
          );
          assert_eq!(
              resolve_custom_budget(
-@@ -1126,7 +1141,11 @@ mod tests {
+@@ -1170,7 +1185,11 @@ mod tests {
                  &tb,
                  None
              ),
@@ -322,17 +322,17 @@ index 4dd7b46..e554305 100644
  
          // 4. 网关自定义 flash_tiered 为正数，且客户端无思考参数：返回自定义正数
 diff --git a/src-tauri/src/proxy/pipeline/inbound.rs b/src-tauri/src/proxy/pipeline/inbound.rs
-index ff5129b..e4773c8 100644
+index fa061b1..066f502 100644
 --- a/src-tauri/src/proxy/pipeline/inbound.rs
 +++ b/src-tauri/src/proxy/pipeline/inbound.rs
-@@ -1175,6 +1175,15 @@ impl InboundThinkingPipeline {
-                     });
-                 } else {
-                     tc["thinkingBudget"] = json!(budget);
+@@ -1246,6 +1246,15 @@ impl InboundThinkingPipeline {
+                             budget
+                         };
+                     tc["thinkingBudget"] = json!(effective_budget);
 +                    if is_tiered {
 +                        if let Some(effort) = client_effort.map(str::trim) {
 +                            if crate::proxy::model_specs::tiered_effort_budget(effort)
-+                                == Some(budget)
++                                == Some(effective_budget)
 +                            {
 +                                tc["effort"] = json!(effort);
 +                            }
@@ -341,7 +341,7 @@ index ff5129b..e4773c8 100644
                  }
              } else if is_tiered {
                  // Tiered 模型未指定具体数字 budget 且官方结构体无 thinking_budget 时：纯自适应模式
-@@ -1186,6 +1195,19 @@ impl InboundThinkingPipeline {
+@@ -1257,6 +1266,19 @@ impl InboundThinkingPipeline {
              generation_config["thinkingConfig"] = tc;
          }
  
@@ -361,7 +361,7 @@ index ff5129b..e4773c8 100644
          // 终审上限保护与不变量协调状态机：
          // 1. 获取官方模型结构体的物理最大输出硬顶 (safe_limit)
          let safe_limit = official_info
-@@ -1204,6 +1226,12 @@ impl InboundThinkingPipeline {
+@@ -1275,6 +1297,12 @@ impl InboundThinkingPipeline {
                  }
              });
  
@@ -374,7 +374,7 @@ index ff5129b..e4773c8 100644
          // 客户端/用户当前传入的 maxOutputTokens（若缺省则默认按官方 safe_limit 填齐）
          let user_provided_max = generation_config
              .get("maxOutputTokens")
-@@ -1233,7 +1261,7 @@ impl InboundThinkingPipeline {
+@@ -1304,7 +1332,7 @@ impl InboundThinkingPipeline {
                  // 证明用户/客户端强烈希望短平快直接回答，不希望被高思考拖慢！
                  // 此时压缩思考预算为 max(0, m - 1024)。若 m <= 1024 则预算为 0！
                  if let Some(user_m) = user_provided_max {
@@ -383,7 +383,7 @@ index ff5129b..e4773c8 100644
                          let fast_budget = if user_m > 1024 { user_m - 1024 } else { 0 };
                          final_budget = fast_budget;
                          tracing::info!(
-@@ -1247,9 +1275,14 @@ impl InboundThinkingPipeline {
+@@ -1318,9 +1346,14 @@ impl InboundThinkingPipeline {
                  if final_budget > 0 {
                      // 【分支 2: 常规深度推理 - 官方容量能包住时优先自动扩充 m】
                      // 如果 final_budget + 1024 <= safe_limit：
@@ -400,7 +400,7 @@ index ff5129b..e4773c8 100644
                              tracing::info!(
                                  "[Pipeline-Inbound] Auto-expanded maxOutputTokens from {} to {} to preserve thinkingBudget ({}) within official safe_limit ({})",
                                  current_max, final_max, final_budget, safe_limit
-@@ -2345,6 +2378,57 @@ mod tests {
+@@ -2436,6 +2469,57 @@ mod tests {
          );
      }
  
@@ -459,7 +459,7 @@ index ff5129b..e4773c8 100644
      fn test_configure_inbound_thinking_client_mode_routing_clean_isolation() {
          use crate::proxy::config::{
 diff --git a/src-tauri/src/proxy/pipeline/official_alignment_tests.rs b/src-tauri/src/proxy/pipeline/official_alignment_tests.rs
-index 3a8ea55..02c0ae9 100644
+index b924923..1530857 100644
 --- a/src-tauri/src/proxy/pipeline/official_alignment_tests.rs
 +++ b/src-tauri/src/proxy/pipeline/official_alignment_tests.rs
 @@ -529,7 +529,7 @@ mod tests {
