@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Aggregated token statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,19 +76,24 @@ pub(crate) fn get_db_path() -> Result<PathBuf, String> {
     Ok(data_dir.join("token_stats.db"))
 }
 
-fn connect_db() -> Result<Connection, String> {
-    let db_path = get_db_path()?;
+pub(crate) fn open_conn_at(db_path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(|e| e.to_string())?;
     // Enable WAL mode for better concurrency
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
-    conn.pragma_update(None, "busy_timeout", 5000)
-        .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
+    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
 
     Ok(conn)
+}
+
+fn connect_db() -> Result<Connection, String> {
+    let db_path = get_db_path()?;
+    open_conn_at(&db_path)
 }
 
 fn add_column_if_missing(conn: &Connection, table: &str, column_def: &str) -> Result<(), String> {
@@ -233,6 +238,29 @@ fn migrate_legacy_unmapped_models(conn: &Connection) {
             params![routed_model, original_model],
         );
     }
+}
+
+/// Non-blocking async token usage recording via background batch writer
+pub fn record_usage_async(
+    account_email: &str,
+    model: &str,
+    requested_model: Option<&str>,
+    input_tokens: u32,
+    output_tokens: u32,
+    cached_tokens: u32,
+    reasoning_tokens: u32,
+    ttft_ms: Option<f64>,
+) -> Result<(), String> {
+    crate::modules::token_stats_writer::enqueue_usage(
+        account_email,
+        model,
+        requested_model,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        reasoning_tokens,
+        ttft_ms,
+    )
 }
 
 /// Record token usage from a request

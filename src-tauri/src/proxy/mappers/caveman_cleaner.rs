@@ -49,6 +49,12 @@ static MULTI_SPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[ \t]+").unwrap()
 
 static MULTI_NEWLINE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
 
+static MAKE_SURE_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?i)\b(make|be)\s+sure\b").unwrap());
+
+static RESTORE_MAKE_SURE_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?i)__PROTECTED_SURE_(make|be)__").unwrap());
+
 pub struct CavemanCleaner;
 
 impl CavemanCleaner {
@@ -70,8 +76,7 @@ impl CavemanCleaner {
             .to_string();
 
         // 1.5. Protect "make sure" and "be sure" before removing "sure" as a filler
-        let make_sure_re = Regex::new(r"(?i)\b(make|be)\s+sure\b").unwrap();
-        let placeholder_text_protected = make_sure_re
+        let placeholder_text_protected = MAKE_SURE_RE
             .replace_all(&placeholder_text, |caps: &regex::Captures| {
                 let verb = caps.get(1).unwrap().as_str().to_string();
                 format!("__PROTECTED_SURE_{}__", verb)
@@ -88,8 +93,7 @@ impl CavemanCleaner {
         compressed_text = Self::cleanup_artifacts(&compressed_text);
 
         // Restore protected "sure" phrases
-        let restore_make_sure_re = Regex::new(r"(?i)__PROTECTED_SURE_(make|be)__").unwrap();
-        compressed_text = restore_make_sure_re
+        compressed_text = RESTORE_MAKE_SURE_RE
             .replace_all(&compressed_text, |caps: &regex::Captures| {
                 let verb = caps.get(1).unwrap().as_str().to_string();
                 format!("{} sure", verb)

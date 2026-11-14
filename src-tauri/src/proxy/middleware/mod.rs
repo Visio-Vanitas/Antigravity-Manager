@@ -5,6 +5,7 @@ pub mod cors;
 pub mod ip_filter;
 pub mod logging;
 pub mod monitor;
+pub mod monitor_usage_tap;
 
 pub mod service_status;
 

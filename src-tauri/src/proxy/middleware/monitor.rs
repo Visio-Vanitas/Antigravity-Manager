@@ -16,7 +16,7 @@ const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB
 const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB for image responses
 const MAX_LOGGED_FIELD_CHARS: usize = 500;
 
-async fn next_chunk_while_receiver_open<S, T>(
+pub(crate) async fn next_chunk_while_receiver_open<S, T>(
     stream: &mut S,
     tx: &tokio::sync::mpsc::Sender<T>,
 ) -> Option<S::Item>
@@ -499,7 +499,7 @@ fn summarize_image_json_response(json: &Value) -> Option<String> {
 }
 
 /// Helper function to record User Token usage
-fn record_user_token_usage(
+pub(crate) fn record_user_token_usage(
     user_token_identity: &Option<UserTokenIdentity>,
     log: &ProxyRequestLog,
     user_agent: Option<String>,
@@ -517,7 +517,7 @@ fn record_user_token_usage(
     }
 }
 
-fn extract_cached_tokens(usage: &Value) -> Option<u32> {
+pub(crate) fn extract_cached_tokens(usage: &Value) -> Option<u32> {
     let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
     if c.cached_tokens > 0 {
         Some(c.cached_tokens)
@@ -526,7 +526,7 @@ fn extract_cached_tokens(usage: &Value) -> Option<u32> {
     }
 }
 
-fn extract_input_tokens(usage: &Value) -> Option<u32> {
+pub(crate) fn extract_input_tokens(usage: &Value) -> Option<u32> {
     let has_field = usage.get("prompt_tokens").is_some()
         || usage.get("input_tokens").is_some()
         || usage.get("total_input_tokens").is_some()
@@ -538,7 +538,7 @@ fn extract_input_tokens(usage: &Value) -> Option<u32> {
     Some(c.total_input_tokens)
 }
 
-fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
+pub(crate) fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
     let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
     if c.reasoning_tokens > 0 {
         Some(c.reasoning_tokens)
@@ -547,7 +547,7 @@ fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
     }
 }
 
-fn extract_output_tokens(usage: &Value) -> Option<u32> {
+pub(crate) fn extract_output_tokens(usage: &Value) -> Option<u32> {
     let has_field = usage.get("completion_tokens").is_some()
         || usage.get("output_tokens").is_some()
         || usage.get("total_output_tokens").is_some()
@@ -965,18 +965,66 @@ fn consolidate_non_streaming_response(
     ))
 }
 
+pub(crate) fn extract_model_from_uri(uri: &str) -> Option<String> {
+    if uri.contains("/v1beta/models/") {
+        uri.split("/v1beta/models/")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+    } else if uri.contains("/v1/models/claude/") {
+        uri.split("/v1/models/claude/")
+            .nth(1)
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+    } else if uri.contains("/v1/models/") {
+        uri.split("/v1/models/")
+            .nth(1)
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+    } else if uri.contains("/v1/model/") {
+        uri.split("/v1/model/")
+            .nth(1)
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+    } else if uri.contains("/responses/models/") {
+        uri.split("/responses/models/")
+            .nth(1)
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn extract_protocol_from_uri(uri: &str) -> Option<String> {
+    if uri.contains("/v1/messages") || uri.contains("/v1/models/claude") {
+        Some("anthropic".to_string())
+    } else if uri.contains("/v1beta/models") {
+        Some("gemini".to_string())
+    } else if uri.contains("/responses") {
+        Some("responses".to_string())
+    } else if uri.starts_with("/v1/") {
+        Some("openai".to_string())
+    } else {
+        None
+    }
+}
+
 pub async fn monitor_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    let _logging_enabled = state.monitor.is_enabled();
-
     let method = request.method().to_string();
     let uri = request.uri().to_string();
 
     if uri.contains("event_logging") || uri.contains("/api/") || uri.starts_with("/internal/") {
         return next.run(request).await;
+    }
+
+    if !state.monitor.is_enabled() {
+        return super::monitor_usage_tap::run_disabled_monitor_fastpath(state, request, next).await;
     }
 
     let start = Instant::now();
@@ -1010,35 +1058,7 @@ pub async fn monitor_middleware(
         .unwrap_or("")
         .to_string();
 
-    let mut model = if uri.contains("/v1beta/models/") {
-        uri.split("/v1beta/models/")
-            .nth(1)
-            .and_then(|s| s.split(':').next())
-            .and_then(|s| s.split('?').next())
-            .map(|s| s.to_string())
-    } else if uri.contains("/v1/models/claude/") {
-        uri.split("/v1/models/claude/")
-            .nth(1)
-            .and_then(|s| s.split('?').next())
-            .map(|s| s.to_string())
-    } else if uri.contains("/v1/models/") {
-        uri.split("/v1/models/")
-            .nth(1)
-            .and_then(|s| s.split('?').next())
-            .map(|s| s.to_string())
-    } else if uri.contains("/v1/model/") {
-        uri.split("/v1/model/")
-            .nth(1)
-            .and_then(|s| s.split('?').next())
-            .map(|s| s.to_string())
-    } else if uri.contains("/responses/models/") {
-        uri.split("/responses/models/")
-            .nth(1)
-            .and_then(|s| s.split('?').next())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
+    let mut model = extract_model_from_uri(&uri);
 
     let request_headers_json =
         crate::proxy::payload_audit::headers_to_redacted_json(request.headers());
@@ -1153,17 +1173,7 @@ pub async fn monitor_middleware(
         .map(|s| s.to_string());
 
     // Determine protocol from URL path
-    let protocol = if uri.contains("/v1/messages") || uri.contains("/v1/models/claude") {
-        Some("anthropic".to_string())
-    } else if uri.contains("/v1beta/models") {
-        Some("gemini".to_string())
-    } else if uri.contains("/responses") {
-        Some("responses".to_string())
-    } else if uri.starts_with("/v1/") {
-        Some("openai".to_string())
-    } else {
-        None
-    };
+    let protocol = extract_protocol_from_uri(&uri);
 
     // Client IP has been extracted at the beginning of the function
 

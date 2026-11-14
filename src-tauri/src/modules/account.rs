@@ -15,16 +15,33 @@ use crate::modules;
 use once_cell::sync::Lazy;
 use std::sync::{Mutex, OnceLock, RwLock};
 
-/// Global per-account lock to prevent concurrent write collisions on the same account JSON file
+/// Global per-account lock to prevent concurrent write collisions on the same account JSON file.
+///
+/// Lock ordering contract (strictly unidirectional to prevent deadlocks):
+/// `ACCOUNT_INDEX_LOCK -> ACCOUNT_FILE_LOCKS[id]`
+/// Never acquire `ACCOUNT_INDEX_LOCK` while holding a per-account file lock.
 static ACCOUNT_FILE_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-fn get_account_lock(account_id: &str) -> Arc<Mutex<()>> {
+const ACCOUNT_FILE_LOCKS_PRUNE_THRESHOLD: usize = 4096;
+
+pub(crate) fn get_account_file_lock(account_id: &str) -> Arc<Mutex<()>> {
     let mut locks = ACCOUNT_FILE_LOCKS.lock().unwrap();
+    if locks.len() > ACCOUNT_FILE_LOCKS_PRUNE_THRESHOLD {
+        locks.retain(|_, v| Arc::strong_count(v) > 1);
+    }
     locks
         .entry(account_id.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+pub(crate) fn get_account_file_lock_for_path(path: &Path) -> Arc<Mutex<()>> {
+    let account_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("__unknown__");
+    get_account_file_lock(account_id)
 }
 
 #[cfg(test)]
@@ -2196,7 +2213,8 @@ mod tests {
     }
 }
 
-/// Global account write lock to prevent corruption during concurrent operations
+/// Global account write lock to prevent corruption during concurrent operations.
+/// Lock ordering contract: `ACCOUNT_INDEX_LOCK -> ACCOUNT_FILE_LOCKS[id]`.
 static ACCOUNT_INDEX_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 pub(crate) fn lock_account_file_updates() -> Result<std::sync::MutexGuard<'static, ()>, String> {
@@ -2965,7 +2983,7 @@ pub fn load_account(account_id: &str) -> Result<Account, String> {
 
 /// Save account data at specific file path (thread-safe and atomic)
 fn save_account_at_path(account_path: &PathBuf, account: &Account) -> Result<(), String> {
-    let _lock = get_account_lock(&account.id);
+    let _lock = get_account_file_lock(&account.id);
     let _guard = _lock.lock().unwrap();
 
     let content = serde_json::to_string_pretty(account)

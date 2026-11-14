@@ -1904,7 +1904,33 @@ pub async fn handle_messages(
             }
         };
 
-        let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
+        let in_flight_guard = match token_manager.acquire_in_flight_bounded(&account_id).await {
+            Ok(guard) => Arc::new(guard),
+            Err(limit_err) => {
+                tracing::warn!(
+                    "[ConcurrencyLimiter] {} (attempt {}/{})",
+                    limit_err,
+                    attempt + 1,
+                    max_attempts
+                );
+                if attempt + 1 < max_attempts {
+                    attempted_accounts.insert(account_id.clone());
+                    force_rotate = true;
+                    continue;
+                }
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": limit_err
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);

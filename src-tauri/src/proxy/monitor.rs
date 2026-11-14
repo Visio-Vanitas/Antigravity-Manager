@@ -534,26 +534,23 @@ impl ProxyMonitor {
         if let (Some(account), Some(input), Some(output)) =
             (&log.account_email, log.input_tokens, log.output_tokens)
         {
-            let model = log.effective_model().to_string();
-            let requested_model = log.model.clone();
-            let account = account.clone();
+            let model = log.effective_model();
+            let requested_model = log.model.as_deref();
             let cached = log.cached_tokens.unwrap_or(0);
             let reasoning = log.reasoning_tokens.unwrap_or(0);
             let ttft_ms = log.ttft_ms();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = crate::modules::token_stats::record_usage(
-                    &account,
-                    &model,
-                    requested_model.as_deref(),
-                    input,
-                    output,
-                    cached,
-                    reasoning,
-                    ttft_ms,
-                ) {
-                    tracing::debug!("Failed to record token stats: {}", e);
-                }
-            });
+            if let Err(e) = crate::modules::token_stats::record_usage_async(
+                account,
+                model,
+                requested_model,
+                input,
+                output,
+                cached,
+                reasoning,
+                ttft_ms,
+            ) {
+                tracing::debug!("Failed to enqueue token stats: {}", e);
+            }
         }
 
         if !self.is_enabled() {
@@ -642,8 +639,9 @@ impl ProxyMonitor {
                     username: summary.username.clone(),
                 };
 
-                if let Err(e) = crate::modules::security_db::save_ip_access_log(&security_log) {
-                    tracing::error!("Failed to save security log: {}", e);
+                if let Err(e) = crate::modules::security_db::save_ip_access_log_async(security_log)
+                {
+                    tracing::error!("Failed to enqueue security log: {}", e);
                 }
             }
         });

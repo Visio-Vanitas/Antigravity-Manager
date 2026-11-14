@@ -877,9 +877,11 @@ impl RateLimitTracker {
     }
 
     fn parse_duration_string_baseline(&self, value: &str) -> Option<u64> {
-        let re = Regex::new(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?")
-            .ok()?;
-        let captures = re.captures(value)?;
+        static DURATION_BASELINE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?")
+                .unwrap()
+        });
+        let captures = DURATION_BASELINE_RE.captures(value)?;
         let hours = captures
             .get(1)
             .and_then(|value| value.as_str().parse::<u64>().ok())
@@ -933,25 +935,29 @@ impl RateLimitTracker {
             }
         }
 
-        if let Ok(re) = Regex::new(r"(?i)resets in ([^.,;\]\n]+)") {
-            if let Some(caps) = re.captures(body) {
-                if let Some(dur_str) = caps.get(1).map(|m| m.as_str()) {
-                    if let Some(dur) = self.parse_duration_string_baseline(dur_str) {
-                        return Some(dur);
-                    }
+        static RESETS_IN_BASELINE_RE: std::sync::LazyLock<Regex> =
+            std::sync::LazyLock::new(|| Regex::new(r"(?i)resets in ([^.,;\]\n]+)").unwrap());
+        static RETRY_BODY_PATTERNS_BASELINE_RE: std::sync::LazyLock<Vec<Regex>> =
+            std::sync::LazyLock::new(|| {
+                vec![
+                    Regex::new(r"(?i)try again in (\d+)m\s*(\d+)s").unwrap(),
+                    Regex::new(r"(?i)(?:try again in|backoff for|wait)\s*(\d+)s").unwrap(),
+                    Regex::new(r"(?i)quota will reset in (\d+) second").unwrap(),
+                    Regex::new(r"(?i)retry after (\d+) second").unwrap(),
+                    Regex::new(r"\(wait (\d+)s\)").unwrap(),
+                ]
+            });
+
+        if let Some(caps) = RESETS_IN_BASELINE_RE.captures(body) {
+            if let Some(dur_str) = caps.get(1).map(|m| m.as_str()) {
+                if let Some(dur) = self.parse_duration_string_baseline(dur_str) {
+                    return Some(dur);
                 }
             }
         }
 
-        for pattern in [
-            r"(?i)try again in (\d+)m\s*(\d+)s",
-            r"(?i)(?:try again in|backoff for|wait)\s*(\d+)s",
-            r"(?i)quota will reset in (\d+) second",
-            r"(?i)retry after (\d+) second",
-            r"\(wait (\d+)s\)",
-        ] {
-            let captures = Regex::new(pattern).ok()?.captures(body);
-            let Some(captures) = captures else {
+        for re in RETRY_BODY_PATTERNS_BASELINE_RE.iter() {
+            let Some(captures) = re.captures(body) else {
                 continue;
             };
             if captures.len() == 3 {

@@ -4,13 +4,20 @@ use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 use tokio_util::sync::CancellationToken;
 
 use crate::models::account::{classify_lock_reason, AccountLockKind};
+pub use crate::proxy::account_limiter::{
+    AccountConcurrencyLimiter, AccountInFlightGuard as InFlightGuard,
+};
 use crate::proxy::rate_limit::RateLimitTracker;
 use crate::proxy::server::{ImagePermit, ImageScheduler};
+use crate::proxy::session_bindings::SessionBindings;
 use crate::proxy::sticky_config::StickySessionConfig;
+
+static VALIDATION_URL_REGEX: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"https://[^\s"'\\]+"#).unwrap());
 
 /// 账号 JSON 模型清单的解析缓存快照（模块级，见 `get_available_models_from_json`）
 struct AccountModelFileSnapshot {
@@ -113,14 +120,16 @@ async fn update_account_json(
 ) -> Result<(), String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let _account_write = crate::modules::account::lock_account_file_updates()?;
+        let account_lock = crate::modules::account::get_account_file_lock_for_path(&path);
+        let _account_write = account_lock.lock().unwrap_or_else(|e| e.into_inner());
         let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {}", e))?;
         let mut content: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| format!("解析 JSON 失败: {}", e))?;
         update(&mut content);
         let serialized = serde_json::to_string_pretty(&content)
             .map_err(|e| format!("序列化 JSON 失败: {}", e))?;
-        std::fs::write(&path, serialized).map_err(|e| format!("写入文件失败: {}", e))
+        crate::utils::fs::write_atomic(&path, serialized.as_bytes())
+            .map_err(|e| format!("写入文件失败: {}", e))
     })
     .await
     .map_err(|e| format!("spawn_blocking panicked: {}", e))?
@@ -329,33 +338,14 @@ impl ProxyToken {
     }
 }
 
-/// 活跃在途请求 RAII Guard：在请求处理或流式传输期间持有，Drop 时原子释放并发计数
-#[derive(Debug)]
-pub struct InFlightGuard {
-    pub account_id: String,
-    counter: Arc<AtomicUsize>,
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        let prev = self.counter.fetch_sub(1, Ordering::SeqCst);
-        tracing::debug!(
-            "📉 [InFlight] Released request for account {}: {} -> {}",
-            self.account_id,
-            prev,
-            prev.saturating_sub(1)
-        );
-    }
-}
-
 pub struct TokenManager {
-    tokens: Arc<DashMap<String, ProxyToken>>, // account_id -> ProxyToken
+    tokens: Arc<DashMap<String, Arc<ProxyToken>>>, // account_id -> Arc<ProxyToken>
     current_index: Arc<AtomicUsize>,
     last_used_account: Arc<tokio::sync::Mutex<Option<(String, std::time::Instant)>>>,
     data_dir: PathBuf,
     rate_limit_tracker: Arc<RateLimitTracker>, // 新增: 限流跟踪器
     sticky_config: Arc<tokio::sync::RwLock<StickySessionConfig>>, // 新增：调度配置
-    session_accounts: Arc<DashMap<String, String>>, // 新增：会话与账号映射 (SessionID -> AccountID)
+    session_accounts: Arc<SessionBindings>, // 新增：带容量与 TTL 的会话与账号映射 (SessionID -> AccountID)
     preferred_account_id: Arc<tokio::sync::RwLock<Option<String>>>, // [FIX #820] 优先使用的账号ID（固定账号模式）
     health_scores: Arc<DashMap<String, f32>>,                       // account_id -> health_score
     circuit_breaker_config: Arc<tokio::sync::RwLock<crate::models::CircuitBreakerConfig>>, // [NEW] 熔断配置缓存
@@ -387,8 +377,8 @@ pub struct TokenManager {
     /// 确保无论通过 Tauri / HTTP API / CLI 哪条路径导入新账号，门禁都能在 2 秒内看到它。
     last_gate_pool_refresh: Arc<AtomicI64>,
 
-    /// [NEW] 活跃在途请求跟踪器: account_id -> 实时并发计数
-    in_flight_requests: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// [NEW] 活跃在途请求跟踪与有界并发限流器
+    in_flight_requests: Arc<AccountConcurrencyLimiter>,
 
     /// [NEW] QoS 智能熔断与阶梯探针守卫
     pub qos_guardian: Arc<crate::proxy::qos_guardian::QoSGuardian>,
@@ -415,7 +405,7 @@ impl TokenManager {
             data_dir,
             rate_limit_tracker: Arc::new(RateLimitTracker::new()),
             sticky_config: Arc::new(tokio::sync::RwLock::new(StickySessionConfig::default())),
-            session_accounts: Arc::new(DashMap::new()),
+            session_accounts: Arc::new(SessionBindings::new()),
             preferred_account_id: Arc::new(tokio::sync::RwLock::new(None)), // [FIX #820]
             health_scores: Arc::new(DashMap::new()),
             circuit_breaker_config: Arc::new(tokio::sync::RwLock::new(
@@ -431,7 +421,7 @@ impl TokenManager {
             image_scheduler: std::sync::RwLock::new(None),
             unsupported_models: Arc::new(DashMap::new()),
             last_gate_pool_refresh: Arc::new(AtomicI64::new(0)),
-            in_flight_requests: Arc::new(DashMap::new()),
+            in_flight_requests: Arc::new(AccountConcurrencyLimiter::new()),
             qos_guardian: {
                 let qos_auto_jail = crate::modules::config::load_app_config()
                     .map(|c| c.proxy.qos_auto_jail)
@@ -444,32 +434,54 @@ impl TokenManager {
         }
     }
 
+    fn account_file_path(&self, account_id: &str) -> PathBuf {
+        if let Some(entry) = self.tokens.get(account_id) {
+            entry.account_path.clone()
+        } else {
+            self.resolved_data_dir()
+                .join("accounts")
+                .join(format!("{}.json", account_id))
+        }
+    }
+
+    fn mutate_token(&self, account_id: &str, f: impl FnOnce(&mut ProxyToken)) -> bool {
+        if let Some(mut entry) = self.tokens.get_mut(account_id) {
+            f(Arc::make_mut(&mut *entry));
+            true
+        } else {
+            false
+        }
+    }
+
     /// 获取指定账号当前的活跃在途请求数
     pub fn get_in_flight(&self, account_id: &str) -> usize {
-        self.in_flight_requests
-            .get(account_id)
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        self.in_flight_requests.get_in_flight(account_id)
     }
 
     /// 获取指定账号的在途并发许可 Guard（生命周期结束或 Drop 时自动原子释放）
     pub fn acquire_in_flight(&self, account_id: &str) -> InFlightGuard {
-        let counter = self
-            .in_flight_requests
-            .entry(account_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone();
-        let prev = counter.fetch_add(1, Ordering::SeqCst);
-        tracing::debug!(
-            "📈 [InFlight] Acquired request for account {}: {} -> {}",
-            account_id,
-            prev,
-            prev + 1
-        );
-        InFlightGuard {
-            account_id: account_id.to_string(),
-            counter,
-        }
+        self.in_flight_requests.acquire_unbounded(account_id)
+    }
+
+    /// 获取指定账号的有界在途并发许可 Guard（读取 sticky_config 的 max_concurrent_per_account 与 account_queue_timeout_ms）
+    pub async fn acquire_in_flight_bounded(
+        &self,
+        account_id: &str,
+    ) -> Result<InFlightGuard, String> {
+        let (max_concurrent, queue_timeout_ms) = {
+            let cfg = self.sticky_config.read().await;
+            (
+                cfg.resolve_max_concurrent_per_account(),
+                cfg.resolve_account_queue_timeout_ms(),
+            )
+        };
+        self.in_flight_requests
+            .acquire_bounded(
+                account_id,
+                max_concurrent,
+                std::time::Duration::from_millis(queue_timeout_ms),
+            )
+            .await
     }
 
     pub(crate) fn register_image_scheduler(&self, scheduler: &Arc<ImageScheduler>) {
@@ -497,9 +509,10 @@ impl TokenManager {
         }
     }
 
-    /// 启动限流记录自动清理后台任务（每15秒检查并清除过期记录）
+    /// 启动限流记录与粘性会话过期自动清理后台任务（每15秒检查并清除过期记录）
     pub async fn start_rate_limit_cleanup(&self) {
         let tracker = self.rate_limit_tracker.clone();
+        let sessions = self.session_accounts.clone();
         let cancel = self.cancel_token.child_token();
 
         let handle = tokio::spawn(async move {
@@ -516,6 +529,13 @@ impl TokenManager {
                             tracing::info!(
                                 "Auto-cleanup: Removed {} expired rate limit record(s)",
                                 cleaned
+                            );
+                        }
+                        let expired_sessions = sessions.evict_expired();
+                        if expired_sessions > 0 {
+                            tracing::debug!(
+                                "Auto-cleanup: Evicted {} expired sticky session(s)",
+                                expired_sessions
                             );
                         }
                     }
@@ -662,7 +682,7 @@ impl TokenManager {
         // 快速前置检查：若未达到缓冲刷新线，直接返回现有 token
         if let Some(entry) = self.tokens.get(account_id) {
             if now < entry.timestamp - buffer_secs {
-                return Ok(entry.clone());
+                return Ok((**entry).clone());
             }
         }
 
@@ -683,7 +703,7 @@ impl TokenManager {
                         "账号 {} 在等待刷新锁期间已完成刷新，复用最新 Token",
                         token_email
                     );
-                    return Ok(latest.clone());
+                    return Ok((**latest).clone());
                 }
             }
 
@@ -702,10 +722,11 @@ impl TokenManager {
                     self.invalid_grant_failures.remove(account_id);
 
                     let updated_token = if let Some(mut entry) = self.tokens.get_mut(account_id) {
-                        entry.access_token = token_response.access_token.clone();
-                        entry.expires_in = token_response.expires_in;
-                        entry.timestamp = now + token_response.expires_in;
-                        entry.clone()
+                        let t = Arc::make_mut(&mut *entry);
+                        t.access_token = token_response.access_token.clone();
+                        t.expires_in = token_response.expires_in;
+                        t.timestamp = now + token_response.expires_in;
+                        t.clone()
                     } else {
                         return Err(format!("账号 {} 在刷新过程中被移除", account_id));
                     };
@@ -721,10 +742,11 @@ impl TokenManager {
                         let write_ts = now + expires_in;
                         let client_key = token_response.oauth_client_key;
                         tokio::task::spawn_blocking(move || {
-                            let Ok(_lk) = crate::modules::account::lock_account_file_updates()
-                            else {
-                                return;
-                            };
+                            let account_lock =
+                                crate::modules::account::get_account_file_lock_for_path(
+                                    &write_path,
+                                );
+                            let _lk = account_lock.lock().unwrap_or_else(|e| e.into_inner());
                             let Ok(raw) = std::fs::read_to_string(&write_path) else {
                                 return;
                             };
@@ -748,7 +770,7 @@ impl TokenManager {
                                 val["token"]["oauth_client_key"] = ck.into();
                             }
                             if let Ok(s) = serde_json::to_string_pretty(&val) {
-                                let _ = std::fs::write(&write_path, s);
+                                let _ = crate::utils::fs::write_atomic(&write_path, s.as_bytes());
                             }
                         });
                     }
@@ -865,15 +887,16 @@ impl TokenManager {
                 Ok(pid) => {
                     let trimmed = pid.trim().to_string();
                     self.project_id_failures.remove(&acct_id);
-                    if let Some(mut entry) = self.tokens.get_mut(&acct_id) {
-                        entry.project_id = Some(trimmed.clone());
-                    }
+                    let pid_for_mem = trimmed.clone();
+                    self.mutate_token(&acct_id, |t| {
+                        t.project_id = Some(pid_for_mem);
+                    });
                     // 写盘后台化，避免阻塞热请求路径
                     let pid_clone = trimmed.clone();
                     tokio::task::spawn_blocking(move || {
-                        let Ok(_lk) = crate::modules::account::lock_account_file_updates() else {
-                            return;
-                        };
+                        let account_lock =
+                            crate::modules::account::get_account_file_lock_for_path(&write_path);
+                        let _lk = account_lock.lock().unwrap_or_else(|e| e.into_inner());
                         let Ok(raw) = std::fs::read_to_string(&write_path) else {
                             return;
                         };
@@ -882,7 +905,7 @@ impl TokenManager {
                         };
                         val["token"]["project_id"] = pid_clone.into();
                         if let Ok(s) = serde_json::to_string_pretty(&val) {
-                            let _ = std::fs::write(&write_path, s);
+                            let _ = crate::utils::fs::write_atomic(&write_path, s.as_bytes());
                         }
                     });
                     trimmed
@@ -1108,7 +1131,7 @@ impl TokenManager {
         self.tokens.retain(|k, _| new_tokens.contains_key(k));
         // 更新或插入新载入的有效账号
         for (k, v) in new_tokens {
-            self.tokens.insert(k, v);
+            self.tokens.insert(k, Arc::new(v));
         }
 
         // 若上次记录的使用账号已不在池中，则安全清理
@@ -1164,7 +1187,8 @@ impl TokenManager {
 
     #[cfg(test)]
     pub(crate) fn insert_token_for_test(&self, token: ProxyToken) {
-        self.tokens.insert(token.account_id.clone(), token);
+        self.tokens
+            .insert(token.account_id.clone(), Arc::new(token));
     }
 
     /// 重新加载指定账号（用于配额更新后的实时同步）
@@ -1234,7 +1258,7 @@ impl TokenManager {
                 // 再按模型粒度释放已恢复的 QuotaExhausted，严格保留 429 速率限制退避与 0 配额模型的锁 (Ref #3840, #3845)
                 self.clear_unsupported_models_for_account(account_id);
                 self.reconcile_recovered_quota_locks(account_id, &token);
-                self.tokens.insert(account_id.to_string(), token);
+                self.tokens.insert(account_id.to_string(), Arc::new(token));
 
                 self.sync_image_scheduler_accounts();
                 let _ = self.get_all_available_models();
@@ -1356,10 +1380,10 @@ impl TokenManager {
         self.project_id_locks.remove(account_id);
         self.project_id_failures.remove(account_id);
         self.invalid_grant_failures.remove(account_id);
-        self.in_flight_requests.remove(account_id);
+        self.in_flight_requests.remove_account(account_id);
         self.clear_unsupported_models_for_account(account_id);
         self.qos_guardian.release_from_jail(account_id);
-        self.session_accounts.retain(|_, v| v != account_id);
+        self.session_accounts.retain_not_account(account_id);
         if let Ok(mut preferred) = self.preferred_account_id.try_write() {
             if preferred.as_deref() == Some(account_id) {
                 *preferred = None;
@@ -1375,7 +1399,7 @@ impl TokenManager {
 
     /// 根据账号 ID 获取完整的 ProxyToken 对象 (v4.1.29)
     pub fn get_token_by_id(&self, account_id: &str) -> Option<ProxyToken> {
-        self.tokens.get(account_id).map(|t| t.clone())
+        self.tokens.get(account_id).map(|t| (**t).clone())
     }
 
     /// Apply a saved priority without resetting sessions or live rate limits.
@@ -1390,21 +1414,21 @@ impl TokenManager {
         priority: u8,
         model_priorities: Option<HashMap<String, u8>>,
     ) {
-        if let Some(mut token) = self.tokens.get_mut(account_id) {
+        self.mutate_token(account_id, |token| {
             token.priority = priority;
             if let Some(mp) = model_priorities {
                 token.model_priorities = mp;
             }
-        }
+        });
     }
 
     /// Apply a saved GCP project_id dynamically to in-memory ProxyToken.
     pub fn update_account_project_id(&self, account_id: &str, project_id: Option<String>) {
-        if let Some(mut token) = self.tokens.get_mut(account_id) {
+        self.mutate_token(account_id, |token| {
             token.project_id = project_id
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-        }
+        });
         self.project_id_failures.remove(account_id);
     }
 
@@ -3605,21 +3629,22 @@ impl TokenManager {
     /// * `attempted` - 已尝试失败的账号 ID 集合
     /// * `normalized_target` - 归一化后的目标模型名
     /// * `quota_protection_enabled` - 是否启用配额保护
-    fn select_with_p2c<'a>(
+    fn select_with_p2c<'a, T: std::borrow::Borrow<ProxyToken>>(
         &self,
-        candidates: &'a [ProxyToken],
+        candidates: &'a [T],
         attempted: &HashSet<String>,
         normalized_target: &str,
         quota_protection_enabled: bool,
-    ) -> Option<&'a ProxyToken> {
+    ) -> Option<&'a T> {
         use rand::Rng;
 
         // 过滤可用 token
-        let mut available: Vec<&ProxyToken> = candidates
+        let mut available: Vec<&'a T> = candidates
             .iter()
-            .filter(|t| !attempted.contains(&t.account_id))
+            .filter(|t| !attempted.contains(&t.borrow().account_id))
             .filter(|t| {
-                !quota_protection_enabled || !t.protected_models.contains(normalized_target)
+                !quota_protection_enabled
+                    || !t.borrow().protected_models.contains(normalized_target)
             })
             .collect();
 
@@ -3629,7 +3654,11 @@ impl TokenManager {
 
         // [QoS Guardian] 剔除处于小黑屋隔离与正在探针探测中的受限账号
         let before_jail = available.len();
-        available.retain(|t| !self.qos_guardian.is_jailed_or_probing(&t.account_id));
+        available.retain(|t| {
+            !self
+                .qos_guardian
+                .is_jailed_or_probing(&t.borrow().account_id)
+        });
         let jailed = before_jail.saturating_sub(available.len());
         if jailed > 0 {
             if available.is_empty() {
@@ -3650,9 +3679,9 @@ impl TokenManager {
         }
 
         // [QoS Guardian] 优先调度纯 Healthy 账号组，避开 Suspicious（只出不进）与 HalfOpen（缓刑试探）
-        let pure_healthy: Vec<&ProxyToken> = available
+        let pure_healthy: Vec<&'a T> = available
             .iter()
-            .filter(|t| self.qos_guardian.is_healthy(&t.account_id))
+            .filter(|t| self.qos_guardian.is_healthy(&t.borrow().account_id))
             .copied()
             .collect();
         if !pure_healthy.is_empty() {
@@ -3676,24 +3705,28 @@ impl TokenManager {
             let mut sorted_pool = available.clone();
             // 排序规则：当前模型的生效优先级数字越小越优先；相同优先级下，在途请求数越小越优先；最后按 account_id 稳定排序
             sorted_pool.sort_by(|a, b| {
-                a.effective_priority(normalized_target, normalized_target)
-                    .cmp(&b.effective_priority(normalized_target, normalized_target))
+                a.borrow()
+                    .effective_priority(normalized_target, normalized_target)
+                    .cmp(
+                        &b.borrow()
+                            .effective_priority(normalized_target, normalized_target),
+                    )
                     .then_with(|| {
-                        self.get_in_flight(&a.account_id)
-                            .cmp(&self.get_in_flight(&b.account_id))
+                        self.get_in_flight(&a.borrow().account_id)
+                            .cmp(&self.get_in_flight(&b.borrow().account_id))
                     })
-                    .then_with(|| a.account_id.cmp(&b.account_id))
+                    .then_with(|| a.borrow().account_id.cmp(&b.borrow().account_id))
             });
             for t in sorted_pool {
-                if !distinct_account_ids.contains(&t.account_id) {
-                    distinct_account_ids.push(t.account_id.clone());
+                if !distinct_account_ids.contains(&t.borrow().account_id) {
+                    distinct_account_ids.push(t.borrow().account_id.clone());
                     if distinct_account_ids.len() == max_spillover {
                         break;
                     }
                 }
             }
             let allowed_set: HashSet<String> = distinct_account_ids.into_iter().collect();
-            available.retain(|t| allowed_set.contains(&t.account_id));
+            available.retain(|t| allowed_set.contains(&t.borrow().account_id));
         }
 
         // [FIX #3840] 目标模型正配额过滤必须**先于**优先级收敛执行。
@@ -3715,9 +3748,10 @@ impl TokenManager {
         // 被提前剔除的本就是不该参与并发调度的零配额账号。
         let has_positive_model_quota = available
             .iter()
-            .any(|t| Self::has_candidate_quota_admission(t, normalized_target));
+            .any(|t| Self::has_candidate_quota_admission(t.borrow(), normalized_target));
         if has_positive_model_quota {
-            available.retain(|t| Self::has_candidate_quota_admission(t, normalized_target));
+            available
+                .retain(|t| Self::has_candidate_quota_admission(t.borrow(), normalized_target));
         } else {
             // 全池候选账号确实均已配额耗尽：本地拦下，杜绝裸奔打爆 Google 429。
             tracing::warn!(
@@ -3728,15 +3762,35 @@ impl TokenManager {
             return None;
         }
 
+        // 若配置了单账号硬并发上限，优先倾向尚未达到上限的账号；若全部达到则保留 Least-Loaded 供后续有界排队
+        let max_concurrent = self
+            .sticky_config
+            .try_read()
+            .map(|c| c.resolve_max_concurrent_per_account())
+            .unwrap_or(0);
+        if max_concurrent > 0 {
+            let under_cap: Vec<&'a T> = available
+                .iter()
+                .copied()
+                .filter(|t| self.get_in_flight(&t.borrow().account_id) < max_concurrent)
+                .collect();
+            if !under_cap.is_empty() {
+                available = under_cap;
+            }
+        }
+
         // Keep lower-priority groups for retries; only this draw is restricted.
         // [NEW] 并发感知与次级分流加速 (Concurrency-Aware & Priority Spillover Acceleration)：
         // 1. 获取当前可用池中针对目标模型的最高生效优先级 min_priority
         let eff_p = |t: &ProxyToken| t.effective_priority(normalized_target, normalized_target);
-        if let Some(min_priority) = available.iter().map(|t| eff_p(t)).min() {
+        if let Some(min_priority) = available.iter().map(|t| eff_p(t.borrow())).min() {
             // 检查最高优先级是否有完全空闲（在途请求数 == 0）的健康账号
-            let min_p_idle: Vec<&ProxyToken> = available
+            let min_p_idle: Vec<&'a T> = available
                 .iter()
-                .filter(|t| eff_p(t) == min_priority && self.get_in_flight(&t.account_id) == 0)
+                .filter(|t| {
+                    eff_p(t.borrow()) == min_priority
+                        && self.get_in_flight(&t.borrow().account_id) == 0
+                })
                 .copied()
                 .collect();
 
@@ -3746,13 +3800,16 @@ impl TokenManager {
             } else {
                 // 最高优先级的所有账号均处于在途处理中 (in_flight > 0)！
                 // 检查更低优先级 (priority > min_priority) 中是否存在完全空闲 (in_flight == 0) 的健康账号
-                let lower_idle: Vec<&ProxyToken> = available
+                let lower_idle: Vec<&'a T> = available
                     .iter()
-                    .filter(|t| eff_p(t) > min_priority && self.get_in_flight(&t.account_id) == 0)
+                    .filter(|t| {
+                        eff_p(t.borrow()) > min_priority
+                            && self.get_in_flight(&t.borrow().account_id) == 0
+                    })
                     .copied()
                     .collect();
 
-                if let Some(next_min_p) = lower_idle.iter().map(|t| eff_p(t)).min() {
+                if let Some(next_min_p) = lower_idle.iter().map(|t| eff_p(t.borrow())).min() {
                     // 🚀 触发多会话分流加速：新会话平滑外溢到次高优先级的空闲账号组，打破单号串行排队阻塞！
                     tracing::info!(
                         "🚀 [Concurrency Spillover] Priority {} accounts are busy (in_flight > 0). Offloading new conversation to idle priority {} account",
@@ -3760,19 +3817,20 @@ impl TokenManager {
                     );
                     available = lower_idle
                         .into_iter()
-                        .filter(|t| eff_p(t) == next_min_p)
+                        .filter(|t| eff_p(t.borrow()) == next_min_p)
                         .collect();
                 } else {
                     // 全池账号皆处于忙碌状态，按最低在途并发度 (Least-Loaded) 筛选，防单号被压垮
                     let min_inflight = available
                         .iter()
-                        .map(|t| self.get_in_flight(&t.account_id))
+                        .map(|t| self.get_in_flight(&t.borrow().account_id))
                         .min()
                         .unwrap_or(0);
-                    available.retain(|t| self.get_in_flight(&t.account_id) == min_inflight);
+                    available
+                        .retain(|t| self.get_in_flight(&t.borrow().account_id) == min_inflight);
                     // 在相同最低并发度的账号中，恢复优先级优选
-                    if let Some(best_p) = available.iter().map(|t| eff_p(t)).min() {
-                        available.retain(|t| eff_p(t) == best_p);
+                    if let Some(best_p) = available.iter().map(|t| eff_p(t.borrow())).min() {
+                        available.retain(|t| eff_p(t.borrow()) == best_p);
                     }
                 }
             }
@@ -3799,17 +3857,19 @@ impl TokenManager {
         let c2 = available[pick2];
 
         // 目标模型配额提取（具备候选自愈与通用配额兜底）
-        let q1 = Self::get_candidate_quota(c1, normalized_target);
-        let q2 = Self::get_candidate_quota(c2, normalized_target);
+        let q1 = Self::get_candidate_quota(c1.borrow(), normalized_target);
+        let q2 = Self::get_candidate_quota(c2.borrow(), normalized_target);
 
         // P2C 临期感知选择：若候选账号存在临期充足配额 (<= 24h 重置且 q > 10%)，优先抽中该临期账号防止配额作废
         let now_ts = chrono::Utc::now().timestamp();
-        let imm1 = Self::get_imminent_deadline_for_model(c1, normalized_target, q1, now_ts);
-        let imm2 = Self::get_imminent_deadline_for_model(c2, normalized_target, q2, now_ts);
+        let imm1 =
+            Self::get_imminent_deadline_for_model(c1.borrow(), normalized_target, q1, now_ts);
+        let imm2 =
+            Self::get_imminent_deadline_for_model(c2.borrow(), normalized_target, q2, now_ts);
 
         // 终审比较：在途并发更少者绝对优先；在途相同时结合临期与剩余配额比较
-        let inflight1 = self.get_in_flight(&c1.account_id);
-        let inflight2 = self.get_in_flight(&c2.account_id);
+        let inflight1 = self.get_in_flight(&c1.borrow().account_id);
+        let inflight2 = self.get_in_flight(&c2.borrow().account_id);
         let selected = if inflight1 != inflight2 {
             if inflight1 < inflight2 {
                 c1
@@ -3839,15 +3899,15 @@ impl TokenManager {
 
         tracing::debug!(
             "🎲 [P2C] Selected {} (in_flight={}, quota={}%) from [{}(in_flight={}, quota={}%), {}(in_flight={}, quota={}%)]",
-            selected.email,
-            self.get_in_flight(&selected.account_id),
-            selected.remaining_quota.unwrap_or(0),
-            c1.email,
+            selected.borrow().email,
+            self.get_in_flight(&selected.borrow().account_id),
+            selected.borrow().remaining_quota.unwrap_or(0),
+            c1.borrow().email,
             inflight1,
-            c1.remaining_quota.unwrap_or(0),
-            c2.email,
+            c1.borrow().remaining_quota.unwrap_or(0),
+            c2.borrow().email,
             inflight2,
-            c2.remaining_quota.unwrap_or(0)
+            c2.borrow().remaining_quota.unwrap_or(0)
         );
 
         Some(selected)
@@ -4173,10 +4233,10 @@ impl TokenManager {
         excluded_accounts: &HashSet<String>,
     ) -> Result<(String, String, String, String, u64), String> {
         let now_ts = chrono::Utc::now().timestamp();
-        let mut tokens_snapshot: Vec<ProxyToken> = self
+        let mut tokens_snapshot: Vec<Arc<ProxyToken>> = self
             .tokens
             .iter()
-            .map(|e| e.value().clone())
+            .map(|e| Arc::clone(e.value()))
             .filter(|token| {
                 if token.validation_blocked
                     && (token.validation_blocked_until == 0
@@ -4516,155 +4576,111 @@ impl TokenManager {
                     .find(|t| &t.account_id == pref_id)
                     .cloned()
                 {
-                    // 检查账号是否可用（未限流、未被配额保护）
-                    match Self::get_account_state_on_disk(&preferred_token.account_path).await {
-                        OnDiskAccountState::Disabled => {
-                            tracing::warn!(
-                                "🔒 [FIX #820] Preferred account {} is disabled on disk, purging and falling back",
-                                preferred_token.email
-                            );
-                            self.remove_account(&preferred_token.account_id);
-                            tokens_snapshot.retain(|t| t.account_id != preferred_token.account_id);
-                            total = tokens_snapshot.len();
+                    let normalized_target =
+                        crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+                            .unwrap_or_else(|| target_model.to_string());
 
-                            {
-                                let mut preferred = self.preferred_account_id.write().await;
-                                if preferred.as_deref() == Some(pref_id.as_str()) {
-                                    *preferred = None;
-                                }
-                            }
+                    let is_validation_blocked = preferred_token.validation_blocked
+                        && (preferred_token.validation_blocked_until == 0
+                            || preferred_token.validation_blocked_until
+                                > chrono::Utc::now().timestamp());
 
-                            if total == 0 {
-                                return Err(self.empty_pool_error());
-                            }
-                        }
-                        OnDiskAccountState::Unknown => {
-                            tracing::warn!(
-                                "🔒 [FIX #820] Preferred account {} state on disk is unavailable, falling back",
-                                preferred_token.email
-                            );
-                            // Don't purge on transient read/parse failures; just skip this token for this request.
-                            tokens_snapshot.retain(|t| t.account_id != preferred_token.account_id);
-                            total = tokens_snapshot.len();
-                            if total == 0 {
-                                return Err(self.empty_pool_error());
-                            }
-                        }
-                        OnDiskAccountState::Enabled => {
-                            let normalized_target =
-                                crate::proxy::common::model_mapping::normalize_to_standard_id(
-                                    target_model,
-                                )
-                                .unwrap_or_else(|| target_model.to_string());
+                    let is_rate_limited = self
+                        .is_rate_limited(&preferred_token.account_id, Some(&normalized_target))
+                        .await;
+                    let is_quota_protected = quota_protection_enabled
+                        && preferred_token
+                            .protected_models
+                            .contains(&normalized_target);
 
-                            let is_validation_blocked = preferred_token.validation_blocked
-                                && (preferred_token.validation_blocked_until == 0
-                                    || preferred_token.validation_blocked_until
-                                        > chrono::Utc::now().timestamp());
-
-                            let is_rate_limited = self
-                                .is_rate_limited(
-                                    &preferred_token.account_id,
-                                    Some(&normalized_target),
-                                )
-                                .await;
-                            let is_quota_protected = quota_protection_enabled
-                                && preferred_token
-                                    .protected_models
-                                    .contains(&normalized_target);
-
-                            // [FIX #3639] 检查优先账号的目标模型配额：多键容错匹配，防止因 key 差异误判满额
-                            let preferred_quota = preferred_token
-                                .model_quotas
+                    // [FIX #3639] 检查优先账号的目标模型配额：多键容错匹配，防止因 key 差异误判满额
+                    let preferred_quota = preferred_token
+                        .model_quotas
+                        .get(&normalized_target)
+                        .or_else(|| preferred_token.model_quotas.get(target_model))
+                        .copied();
+                    let has_zero_quota = preferred_quota.is_some_and(|q| q <= 0);
+                    let has_healthy_alternative = tokens_snapshot.iter().any(|t| {
+                        t.account_id != preferred_token.account_id
+                            && !self
+                                .rate_limit_tracker
+                                .is_rate_limited(&t.account_id, Some(&normalized_target))
+                            && t.model_quotas
                                 .get(&normalized_target)
-                                .or_else(|| preferred_token.model_quotas.get(target_model))
-                                .copied();
-                            let has_zero_quota = preferred_quota.is_some_and(|q| q <= 0);
-                            let has_healthy_alternative = tokens_snapshot.iter().any(|t| {
-                                t.account_id != preferred_token.account_id
-                                    && !self
-                                        .rate_limit_tracker
-                                        .is_rate_limited(&t.account_id, Some(&normalized_target))
-                                    && t.model_quotas
-                                        .get(&normalized_target)
-                                        .or_else(|| t.model_quotas.get(target_model))
-                                        .copied()
-                                        .unwrap_or(0)
-                                        > 0
-                            });
+                                .or_else(|| t.model_quotas.get(target_model))
+                                .copied()
+                                .unwrap_or(0)
+                                > 0
+                    });
 
-                            if is_validation_blocked {
-                                tracing::warn!(
-                                    "🔒 [Validation-Blocked] Preferred account {} is blocked for validation, seamlessly falling back to available account in pool",
-                                    preferred_token.email
-                                );
-                            } else if has_zero_quota && has_healthy_alternative {
-                                tracing::warn!(
-                                    "🔒 [Auto-Switch #3639] Preferred account {} has 0% quota for model {}, seamlessly falling back to available account in pool",
-                                    preferred_token.email,
-                                    normalized_target
-                                );
-                            } else if !is_rate_limited && !is_quota_protected {
-                                tracing::info!(
-                                    "🔒 [FIX #820] Using preferred account: {} (fixed mode)",
-                                    preferred_token.email
-                                );
+                    if is_validation_blocked {
+                        tracing::warn!(
+                            "🔒 [Validation-Blocked] Preferred account {} is blocked for validation, seamlessly falling back to available account in pool",
+                            preferred_token.email
+                        );
+                    } else if has_zero_quota && has_healthy_alternative {
+                        tracing::warn!(
+                            "🔒 [Auto-Switch #3639] Preferred account {} has 0% quota for model {}, seamlessly falling back to available account in pool",
+                            preferred_token.email,
+                            normalized_target
+                        );
+                    } else if !is_rate_limited && !is_quota_protected {
+                        tracing::info!(
+                            "🔒 [FIX #820] Using preferred account: {} (fixed mode)",
+                            preferred_token.email
+                        );
 
-                                // 直接使用优先账号，跳过轮询逻辑
-                                let mut token = preferred_token.clone();
+                        // 直接使用优先账号，跳过轮询逻辑
+                        let mut token = (*preferred_token).clone();
 
-                                // 检查 token 是否过期（提前 300 秒平滑刷新，并应用 3.5s 超时安全管控）
-                                const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
-                                let now = chrono::Utc::now().timestamp();
-                                if now >= token.timestamp - TOKEN_REFRESH_BUFFER_SECS {
-                                    let hot_path_timeout = std::time::Duration::from_millis(3500);
-                                    match self
-                                        .refresh_account_token_with_timeout(
-                                            &token.account_id,
-                                            TOKEN_REFRESH_BUFFER_SECS,
-                                            hot_path_timeout,
-                                        )
-                                        .await
-                                    {
-                                        Ok(refreshed) => {
-                                            token = refreshed;
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Preferred account token refresh failed ({}): {}，继续尝试或回退",
-                                                token.email,
-                                                e
-                                            );
-                                        }
-                                    }
+                        // 检查 token 是否过期（提前 300 秒平滑刷新，并应用 3.5s 超时安全管控）
+                        const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
+                        let now = chrono::Utc::now().timestamp();
+                        if now >= token.timestamp - TOKEN_REFRESH_BUFFER_SECS {
+                            let hot_path_timeout = std::time::Duration::from_millis(3500);
+                            match self
+                                .refresh_account_token_with_timeout(
+                                    &token.account_id,
+                                    TOKEN_REFRESH_BUFFER_SECS,
+                                    hot_path_timeout,
+                                )
+                                .await
+                            {
+                                Ok(refreshed) => {
+                                    token = refreshed;
                                 }
-
-                                // 确保有 project_id
-                                let hot_path_timeout = std::time::Duration::from_millis(3500);
-                                let project_id = self
-                                    .resolve_project_id_with_timeout(
-                                        &token.account_id,
-                                        &token.access_token,
-                                        &token.account_path,
-                                        hot_path_timeout,
-                                    )
-                                    .await;
-
-                                return Ok((
-                                    token.access_token,
-                                    project_id,
-                                    token.email,
-                                    token.account_id,
-                                    0,
-                                ));
-                            } else {
-                                if is_rate_limited {
-                                    tracing::warn!("🔒 [FIX #820] Preferred account {} is rate-limited, falling back to round-robin", preferred_token.email);
-                                } else {
-                                    tracing::warn!("🔒 [FIX #820] Preferred account {} is quota-protected for {}, falling back to round-robin", preferred_token.email, target_model);
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Preferred account token refresh failed ({}): {}，继续尝试或回退",
+                                        token.email,
+                                        e
+                                    );
                                 }
                             }
                         }
+
+                        // 确保有 project_id
+                        let hot_path_timeout = std::time::Duration::from_millis(3500);
+                        let project_id = self
+                            .resolve_project_id_with_timeout(
+                                &token.account_id,
+                                &token.access_token,
+                                &token.account_path,
+                                hot_path_timeout,
+                            )
+                            .await;
+
+                        return Ok((
+                            token.access_token,
+                            project_id,
+                            token.email,
+                            token.account_id,
+                            0,
+                        ));
+                    } else if is_rate_limited {
+                        tracing::warn!("🔒 [FIX #820] Preferred account {} is rate-limited, falling back to round-robin", preferred_token.email);
+                    } else {
+                        tracing::warn!("🔒 [FIX #820] Preferred account {} is quota-protected for {}, falling back to round-robin", preferred_token.email, target_model);
                     }
                 } else {
                     tracing::warn!("🔒 [FIX #820] Preferred account {} not found in pool, falling back to round-robin", pref_id);
@@ -4690,7 +4706,7 @@ impl TokenManager {
             let rotate = force_rotate || attempt > 0;
 
             // ===== 【核心】粘性会话与智能调度逻辑 =====
-            let mut target_token: Option<ProxyToken> = None;
+            let mut target_token: Option<Arc<ProxyToken>> = None;
 
             // 归一化目标模型名为标准 ID，用于配额保护检查
             let normalized_target =
@@ -4705,7 +4721,7 @@ impl TokenManager {
                 let sid = session_id.unwrap();
 
                 // 1. 检查会话是否已绑定账号
-                if let Some(bound_id) = self.session_accounts.get(sid).map(|v| v.clone()) {
+                if let Some(bound_id) = self.session_accounts.get(sid) {
                     // 【修复】先通过 account_id 找到对应的账号，获取其 email
                     // 2. 转换 email -> account_id 检查绑定的账号是否限流
                     if let Some(bound_token) =
@@ -5011,7 +5027,7 @@ impl TokenManager {
                 // 若无锁定或带有 session_id（会话首次分配），使用 P2C 均衡选择账号
                 if target_token.is_none() {
                     // 先过滤出未限流且未被 QoS 封禁的账号
-                    let mut non_limited: Vec<ProxyToken> = Vec::new();
+                    let mut non_limited: Vec<Arc<ProxyToken>> = Vec::new();
                     for t in &tokens_snapshot {
                         if !self
                             .is_rate_limited(&t.account_id, Some(&normalized_target))
@@ -5038,7 +5054,7 @@ impl TokenManager {
                 tracing::debug!("🔄 [Mode C] P2C selection from {} candidates", total);
 
                 // 先过滤出未限流的账号
-                let mut non_limited: Vec<ProxyToken> = Vec::new();
+                let mut non_limited: Vec<Arc<ProxyToken>> = Vec::new();
                 for t in &tokens_snapshot {
                     if !self
                         .is_rate_limited(&t.account_id, Some(&normalized_target))
@@ -5067,12 +5083,7 @@ impl TokenManager {
             if let Some(ref selected) = target_token {
                 if let Some(sid) = session_id {
                     if scheduling.mode != SchedulingMode::PerformanceFirst && !rotate {
-                        let bound = {
-                            self.session_accounts
-                                .entry(sid.to_string())
-                                .or_insert_with(|| selected.account_id.clone())
-                                .clone()
-                        };
+                        let bound = self.session_accounts.bind_or_get(sid, &selected.account_id);
                         if bound != selected.account_id {
                             if let Some(winner) =
                                 tokens_snapshot.iter().find(|t| t.account_id == bound)
@@ -5100,7 +5111,7 @@ impl TokenManager {
                 }
             }
 
-            let mut token = match target_token {
+            let selected_token = match target_token {
                 Some(t) => t,
                 None => {
                     // 乐观重置策略: 双层防护机制
@@ -5185,28 +5196,7 @@ impl TokenManager {
                 }
             };
 
-            // Safety net: avoid selecting an account that has been disabled on disk but still
-            // exists in the in-memory snapshot (e.g. stale cache + sticky session binding).
-            match Self::get_account_state_on_disk(&token.account_path).await {
-                OnDiskAccountState::Disabled => {
-                    tracing::warn!(
-                        "Selected account {} is disabled on disk, purging and retrying",
-                        token.email
-                    );
-                    attempted.insert(token.account_id.clone());
-                    self.remove_account(&token.account_id);
-                    continue;
-                }
-                OnDiskAccountState::Unknown => {
-                    tracing::warn!(
-                        "Selected account {} state on disk is unavailable, skipping",
-                        token.email
-                    );
-                    attempted.insert(token.account_id.clone());
-                    continue;
-                }
-                OnDiskAccountState::Enabled => {}
-            }
+            let mut token = (*selected_token).clone();
 
             // 3. [ENHANCED] 检查 token 是否过期（提前 300 秒/5分钟平滑刷新，保障高可用与并发重试）
             let now = chrono::Utc::now().timestamp();
@@ -5399,7 +5389,7 @@ impl TokenManager {
             current_access_token,
             refresh_token,
             timestamp,
-            expires_in,
+            _expires_in,
             now,
             project_id_opt,
         ) = match token_info {
@@ -5412,7 +5402,7 @@ impl TokenManager {
             .unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
 
         // 检查是否过期 (提前5分钟)
-        if now < timestamp + expires_in - 300 {
+        if now < timestamp - 300 {
             return Ok((
                 current_access_token,
                 project_id,
@@ -5431,11 +5421,13 @@ impl TokenManager {
                 let new_now = chrono::Utc::now().timestamp();
 
                 // 更新缓存
-                if let Some(mut entry) = self.tokens.get_mut(&account_id) {
-                    entry.access_token = token_response.access_token.clone();
-                    entry.expires_in = token_response.expires_in;
-                    entry.timestamp = new_now;
-                }
+                let new_access = token_response.access_token.clone();
+                let new_expires_in = token_response.expires_in;
+                self.mutate_token(&account_id, |entry| {
+                    entry.access_token = new_access;
+                    entry.expires_in = new_expires_in;
+                    entry.timestamp = new_now + new_expires_in;
+                });
 
                 // 保存到磁盘
                 let _ = self
@@ -5649,13 +5641,9 @@ impl TokenManager {
     }
 
     fn clear_all_persisted_live_limits(&self, account_id: &str) -> bool {
-        let path = self
-            .data_dir
-            .join("accounts")
-            .join(format!("{}.json", account_id));
-        let Ok(_account_write) = crate::modules::account::lock_account_file_updates() else {
-            return false;
-        };
+        let path = self.account_file_path(account_id);
+        let account_lock = crate::modules::account::get_account_file_lock_for_path(&path);
+        let _account_write = account_lock.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return false;
         };
@@ -5675,7 +5663,7 @@ impl TokenManager {
         let Ok(serialized) = serde_json::to_string_pretty(&content) else {
             return false;
         };
-        std::fs::write(path, serialized).is_ok()
+        crate::utils::fs::write_atomic(&path, serialized.as_bytes()).is_ok()
     }
 
     /// 标记账号请求成功，重置连续失败计数
@@ -5725,7 +5713,7 @@ impl TokenManager {
             .map(|c| c.mode == crate::proxy::sticky_config::SchedulingMode::CacheFirst)
             .unwrap_or(false);
         if !is_cache_first {
-            self.session_accounts.retain(|_, v| *v != resolved_id);
+            self.session_accounts.retain_not_account(&resolved_id);
         }
         tracing::warn!(
             account_id = %resolved_id,
@@ -6369,7 +6357,8 @@ impl TokenManager {
         match crate::modules::quota::fetch_quota(&access_token, email, Some(&account_id)).await {
             Ok((quota_data, _project_id)) => {
                 // [NEW] 实时刷新成功后，立即同步最新配额数据与 available_models 至内存缓存
-                if let Some(mut token) = self.tokens.get_mut(&account_id) {
+                if let Some(mut entry) = self.tokens.get_mut(&account_id) {
+                    let token = Arc::make_mut(&mut *entry);
                     if !quota_data.models.is_empty() {
                         token.available_models.clear();
                         token.model_limits.clear();
@@ -6659,12 +6648,12 @@ impl TokenManager {
                     // 解析官方时间戳，同步更新内存中 token 的 reset_time
                     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(reset_time_str) {
                         let ts = dt.timestamp();
-                        if let Some(mut t) = self.tokens.get_mut(&account_id) {
+                        self.mutate_token(&account_id, |t| {
                             t.reset_time = Some(ts);
                             if is_weekly_depleted {
                                 t.weekly_reset_time = Some(ts);
                             }
-                        }
+                        });
                     }
 
                     // 广播给前端实时更新账户管理界面的配额进度条与重置倒计时
@@ -6757,39 +6746,31 @@ impl TokenManager {
             .and_then(crate::proxy::rate_limit::normalize_image_model_id)
             .is_some()
         {
-            match crate::modules::account::lock_account_file_updates() {
-                Ok(_account_write) => {
-                    let info = self.parse_rate_limit_with_mode(
+            let path = self.account_file_path(account_id);
+            let account_lock = crate::modules::account::get_account_file_lock_for_path(&path);
+            let _account_write = account_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let info = self.parse_rate_limit_with_mode(
+                account_id,
+                status,
+                retry_after_header,
+                error_body,
+                model,
+                backoff_steps,
+                parser_mode,
+            );
+            if parser_mode == TrackerParserMode::Current {
+                if let Some(ref info) = info {
+                    self.persist_live_limit_locked(
                         account_id,
+                        model,
                         status,
                         retry_after_header,
                         error_body,
-                        model,
-                        backoff_steps,
-                        parser_mode,
-                    );
-                    if parser_mode == TrackerParserMode::Current {
-                        if let Some(ref info) = info {
-                            self.persist_live_limit_locked(
-                                account_id,
-                                model,
-                                status,
-                                retry_after_header,
-                                error_body,
-                                info,
-                            );
-                        }
-                    }
-                    return info;
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        "Failed to serialize live limit update for {}: {}",
-                        account_id,
-                        error
+                        info,
                     );
                 }
             }
+            return info;
         }
 
         self.parse_rate_limit_with_mode(
@@ -6869,7 +6850,7 @@ impl TokenManager {
         let account_id = self
             .email_to_account_id(account_or_email)
             .unwrap_or_else(|| account_or_email.to_string());
-        if let Some(mut token) = self.tokens.get_mut(&account_id) {
+        self.mutate_token(&account_id, |token| {
             if let Some(m) = model {
                 let norm = crate::proxy::common::model_mapping::normalize_to_standard_id(m)
                     .unwrap_or_else(|| m.to_string());
@@ -6887,7 +6868,7 @@ impl TokenManager {
                 account_id,
                 model
             );
-        }
+        });
     }
 
     pub async fn refresh_quota_lock_after_fast_mark(&self, email: &str, model: Option<&str>) {
@@ -7154,7 +7135,7 @@ impl TokenManager {
         let Ok(serialized) = serde_json::to_string_pretty(&content) else {
             return;
         };
-        if let Err(e) = std::fs::write(&path, serialized) {
+        if let Err(e) = crate::utils::fs::write_atomic(&path, serialized.as_bytes()) {
             tracing::debug!("Failed to persist live limit for {}: {}", account_id, e);
         }
     }
@@ -7166,17 +7147,10 @@ impl TokenManager {
         let model_key = crate::proxy::common::model_mapping::normalize_to_standard_id(raw_model)
             .unwrap_or_else(|| raw_model.to_string());
 
-        let path = if let Some(entry) = self.tokens.get(account_id) {
-            entry.account_path.clone()
-        } else {
-            self.resolved_data_dir()
-                .join("accounts")
-                .join(format!("{}.json", account_id))
-        };
+        let path = self.account_file_path(account_id);
 
-        let Ok(_account_write) = crate::modules::account::lock_account_file_updates() else {
-            return;
-        };
+        let account_lock = crate::modules::account::get_account_file_lock_for_path(&path);
+        let _account_write = account_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,
@@ -7210,7 +7184,7 @@ impl TokenManager {
             let Ok(serialized) = serde_json::to_string_pretty(&content) else {
                 return;
             };
-            if let Err(error) = std::fs::write(&path, serialized) {
+            if let Err(error) = crate::utils::fs::write_atomic(&path, serialized.as_bytes()) {
                 tracing::debug!("Failed to clear live limit for {}: {}", account_id, error);
                 return;
             }
@@ -7255,17 +7229,8 @@ impl TokenManager {
 
     /// 比较并删除：只有映射里仍然是这个账号才清掉当前会话。
     pub fn abandon_session(&self, session_id: &str, account_id: &str) -> bool {
-        let still_bound = self
-            .session_accounts
-            .get(session_id)
-            .map(|bound| bound.as_str() == account_id)
-            .unwrap_or(false);
-        if still_bound {
-            self.session_accounts.remove(session_id);
-            true
-        } else {
-            false
-        }
+        self.session_accounts
+            .remove_if_matches(session_id, account_id)
     }
 
     /// 上游成功后写下真正用过的账号。轮换成功的新账号也从这里进入粘性表。
@@ -7276,9 +7241,7 @@ impl TokenManager {
         if session_id.is_empty() || account_id.is_empty() {
             return;
         }
-        self.session_accounts
-            .entry(session_id.to_string())
-            .or_insert_with(|| account_id.to_string());
+        self.session_accounts.bind_or_get(session_id, account_id);
     }
 
     /// 解绑当前会话。不清全局 last_used，避免一个租户的失败打散别人的 60 秒窗口。
@@ -7497,7 +7460,7 @@ impl TokenManager {
         let all_tokens: Vec<ProxyToken> = self
             .tokens
             .iter()
-            .map(|entry| entry.value().clone())
+            .map(|entry| (**entry.value()).clone())
             .collect();
         let rate_limiter = self.rate_limit_tracker.clone();
 
@@ -7527,7 +7490,7 @@ impl TokenManager {
         let all_tokens: Vec<ProxyToken> = self
             .tokens
             .iter()
-            .map(|entry| entry.value().clone())
+            .map(|entry| (**entry.value()).clone())
             .collect();
         let rate_limiter = self.rate_limit_tracker.clone();
 
@@ -7563,7 +7526,7 @@ impl TokenManager {
         let all_tokens: Vec<ProxyToken> = self
             .tokens
             .iter()
-            .map(|entry| entry.value().clone())
+            .map(|entry| (**entry.value()).clone())
             .collect();
         let rate_limiter = self.rate_limit_tracker.clone();
 
@@ -7594,7 +7557,7 @@ impl TokenManager {
         let all_tokens: Vec<ProxyToken> = self
             .tokens
             .iter()
-            .map(|entry| entry.value().clone())
+            .map(|entry| (**entry.value()).clone())
             .collect();
         let rate_limiter = self.rate_limit_tracker.clone();
 
@@ -8424,10 +8387,10 @@ impl TokenManager {
         reason: &str,
     ) -> Result<(), String> {
         // 1. Update memory
-        if let Some(mut token) = self.tokens.get_mut(account_id) {
+        self.mutate_token(account_id, |token| {
             token.validation_blocked = true;
             token.validation_blocked_until = block_until;
-        }
+        });
 
         // 2. Persist to disk
         let path = self
@@ -8464,17 +8427,17 @@ impl TokenManager {
             url
         } else {
             // 回退方案：通过更严格的正则及反序列化解码可能的 \u0026
-            let url_regex = regex::Regex::new(r#"https://[^\s"'\\]+"#).unwrap();
-            url_regex.find(reason).map(|m| {
+            VALIDATION_URL_REGEX.find(reason).map(|m| {
                 let raw_url = m.as_str().to_string();
                 raw_url.replace("\\u0026", "&")
             })
         };
 
         if let Some(ref url) = extracted_url {
-            if let Some(mut token) = self.tokens.get_mut(account_id) {
-                token.validation_url = Some(url.clone());
-            }
+            let url_clone = url.clone();
+            self.mutate_token(account_id, |token| {
+                token.validation_url = Some(url_clone);
+            });
         }
 
         // [FIX] 403 人机验证阻断时，同步标记 proxy_disabled = true，确保前端直接展示禁用反代状态并停止参与调度
@@ -8499,7 +8462,7 @@ impl TokenManager {
         .await?;
 
         // Clear sticky session if blocked
-        self.session_accounts.retain(|_, v| *v != account_id);
+        self.session_accounts.retain_not_account(account_id);
 
         tracing::info!(
             "🚫 Account {} validation blocked until {} (reason: {})",
@@ -8554,7 +8517,7 @@ impl TokenManager {
         )?;
 
         // Clear sticky session if forbidden
-        self.session_accounts.retain(|_, v| *v != account_id);
+        self.session_accounts.retain_not_account(account_id);
 
         match outcome {
             crate::modules::account::ForbiddenApplyResult::AccountLocked => {
@@ -8565,7 +8528,7 @@ impl TokenManager {
                 // 模型级 403：保留账号供其他模型使用，立即冻结当前模型。
                 // mark_account_forbidden 已经触发 reload；这里同步内存 token，
                 // 让本次请求的后续重试立即避开该模型。
-                if let Some(mut token) = self.tokens.get_mut(account_id) {
+                self.mutate_token(account_id, |token| {
                     token.forbidden_models.insert(scope);
                     if let Some(target) = target_model {
                         if let Some(target_cleaned) =
@@ -8588,7 +8551,7 @@ impl TokenManager {
                             token.forbidden_models.insert(alt_base);
                         }
                     }
-                }
+                });
             }
         }
 
@@ -10888,8 +10851,12 @@ mod tests {
         let account_id_2 = token2.account_id.clone();
 
         // 插入账号池
-        manager.tokens.insert(token1.account_id.clone(), token1);
-        manager.tokens.insert(token2.account_id.clone(), token2);
+        manager
+            .tokens
+            .insert(token1.account_id.clone(), Arc::new(token1));
+        manager
+            .tokens
+            .insert(token2.account_id.clone(), Arc::new(token2));
 
         // 发起 Claude 5.5 请求：应收敛并优先调度具备实际能力的账号 2 (即使账号 1 剩余 quota 100% 更高)
         let (chosen_token, _, _, _, _) = manager
@@ -11083,7 +11050,9 @@ mod tests {
         )
         .unwrap();
 
-        manager.tokens.insert(token1.account_id.clone(), token1);
+        manager
+            .tokens
+            .insert(token1.account_id.clone(), Arc::new(token1));
 
         // 模拟遭遇单次 429 导致账号被锁定 5 秒 (wait_sec = 5 > 2s)
         manager.rate_limit_tracker.parse_from_error(
@@ -11154,7 +11123,9 @@ mod tests {
             model_quota_windows: HashMap::new(),
         };
 
-        manager.tokens.insert(token.account_id.clone(), token);
+        manager
+            .tokens
+            .insert(token.account_id.clone(), Arc::new(token));
 
         // 记录失败导致锁定与递增 failure_counts
         manager.rate_limit_tracker.parse_from_error(
@@ -11373,8 +11344,8 @@ mod tests {
         token2.account_path = acc2_path;
         token2.model_quotas = quotas2;
 
-        manager.tokens.insert(acc1_id.to_string(), token1);
-        manager.tokens.insert(acc2_id.to_string(), token2);
+        manager.tokens.insert(acc1_id.to_string(), Arc::new(token1));
+        manager.tokens.insert(acc2_id.to_string(), Arc::new(token2));
 
         let session_id = "agent-coding-session-42";
         // 初始将会话绑定至 acc1
@@ -11441,8 +11412,8 @@ mod tests {
         token2.account_path = acc2_path;
         token2.model_quotas = quotas2;
 
-        manager.tokens.insert(acc1_id.to_string(), token1);
-        manager.tokens.insert(acc2_id.to_string(), token2);
+        manager.tokens.insert(acc1_id.to_string(), Arc::new(token1));
+        manager.tokens.insert(acc2_id.to_string(), Arc::new(token2));
 
         let session_id = "test-session-quota-preservation";
         // 初始将会话绑定至 acc1
@@ -11472,9 +11443,9 @@ mod tests {
 
         // 绑定账号额度为 80% 时，依然保持复用
         let session_high_quota = "test-session-cache-preserved";
-        if let Some(mut t1) = manager.tokens.get_mut(acc1_id) {
+        manager.mutate_token(acc1_id, |t1| {
             t1.model_quotas.insert(norm_target.clone(), 80);
-        }
+        });
         manager.commit_session(session_high_quota, acc1_id);
         let (_token, _project_id, email, selected_id, _wait) = manager
             .get_token_filtered(
@@ -11532,17 +11503,17 @@ mod tests {
         token2.account_path = acc2_path;
         token2.model_quotas = quotas2;
 
-        manager.tokens.insert(acc1_id.to_string(), token1);
-        manager.tokens.insert(acc2_id.to_string(), token2);
+        manager.tokens.insert(acc1_id.to_string(), Arc::new(token1));
+        manager.tokens.insert(acc2_id.to_string(), Arc::new(token2));
 
         let session_id = "test-session-failover-forbidden";
         // 初始将会话绑定至 acc1
         manager.commit_session(session_id, acc1_id);
 
         // 场景 1：acc1 遭遇模型级 403 冻结（进入 forbidden_models），即使配额为 80% 也必须立即解绑并切号到 acc2
-        if let Some(mut t1) = manager.tokens.get_mut(acc1_id) {
+        manager.mutate_token(acc1_id, |t1| {
             t1.forbidden_models.insert(norm_target.clone());
-        }
+        });
 
         let excluded = HashSet::new();
         let (_token, _project_id, email, selected_id, _wait) = manager
@@ -11634,8 +11605,8 @@ mod tests {
         token2.account_path = acc2_path;
         token2.model_quotas = quotas2;
 
-        manager.tokens.insert(acc1_id.to_string(), token1);
-        manager.tokens.insert(acc2_id.to_string(), token2);
+        manager.tokens.insert(acc1_id.to_string(), Arc::new(token1));
+        manager.tokens.insert(acc2_id.to_string(), Arc::new(token2));
 
         // 模拟 60s 窗口内上一请求使用了 acc1
         {
@@ -11683,6 +11654,7 @@ mod tests {
                 request_429_grace_ms: 1500,
                 max_spillover_accounts: 0,
                 affinity_scope: crate::proxy::sticky_config::AffinityScope::Session,
+                ..StickySessionConfig::default()
             })
             .await;
 
@@ -11707,8 +11679,8 @@ mod tests {
         token2.account_path = acc2_path;
         token2.model_quotas = quotas2;
 
-        manager.tokens.insert(acc1_id.to_string(), token1);
-        manager.tokens.insert(acc2_id.to_string(), token2);
+        manager.tokens.insert(acc1_id.to_string(), Arc::new(token1));
+        manager.tokens.insert(acc2_id.to_string(), Arc::new(token2));
 
         let session_id = "test-session-cache-first-strict";
         manager.commit_session(session_id, acc1_id);
@@ -11738,6 +11710,7 @@ mod tests {
                 request_429_grace_ms: 1500,
                 max_spillover_accounts: 0,
                 affinity_scope: crate::proxy::sticky_config::AffinityScope::Session,
+                ..StickySessionConfig::default()
             })
             .await;
         // 连续两次慢首字触发 QoS Jailed
@@ -11805,15 +11778,15 @@ mod tests {
 
         manager.tokens.insert(
             acc_bound_51.to_string(),
-            make_tok(acc_bound_51, "mcl51@test.com", 51),
+            Arc::new(make_tok(acc_bound_51, "mcl51@test.com", 51)),
         );
         manager.tokens.insert(
             acc_low_49.to_string(),
-            make_tok(acc_low_49, "che49@test.com", 49),
+            Arc::new(make_tok(acc_low_49, "che49@test.com", 49)),
         );
         manager.tokens.insert(
             acc_busy_82.to_string(),
-            make_tok(acc_busy_82, "ity82@test.com", 82),
+            Arc::new(make_tok(acc_busy_82, "ity82@test.com", 82)),
         );
 
         let session_id = "test-session-no-ping-pong";
@@ -11884,8 +11857,12 @@ mod tests {
         token2.account_path = alt_path;
         token2.model_quotas = quotas2;
 
-        manager.tokens.insert(acc_pref_id.to_string(), token1);
-        manager.tokens.insert(acc_alt_id.to_string(), token2);
+        manager
+            .tokens
+            .insert(acc_pref_id.to_string(), Arc::new(token1));
+        manager
+            .tokens
+            .insert(acc_alt_id.to_string(), Arc::new(token2));
 
         // 设置固定优先账号为 acc_pref_id
         manager
@@ -11948,8 +11925,12 @@ mod tests {
         token_a.account_path = temp_dir.path().join("acc_expiring.json");
         token_b.account_path = temp_dir.path().join("acc_distant.json");
 
-        manager.tokens.insert(token_a.account_id.clone(), token_a);
-        manager.tokens.insert(token_b.account_id.clone(), token_b);
+        manager
+            .tokens
+            .insert(token_a.account_id.clone(), Arc::new(token_a));
+        manager
+            .tokens
+            .insert(token_b.account_id.clone(), Arc::new(token_b));
 
         // 获取 Token 时，EDF 临期优先调度必须超越生硬的「配额越高越先用」，
         // 优先选中 2 小时后即将重置的账号 A，最大化释放用户周期资产！
@@ -12007,8 +11988,12 @@ mod tests {
         token_a.account_path = temp_dir.path().join("acc_sooner.json");
         token_b.account_path = temp_dir.path().join("acc_later.json");
 
-        manager.tokens.insert(token_a.account_id.clone(), token_a);
-        manager.tokens.insert(token_b.account_id.clone(), token_b);
+        manager
+            .tokens
+            .insert(token_a.account_id.clone(), Arc::new(token_a));
+        manager
+            .tokens
+            .insert(token_b.account_id.clone(), Arc::new(token_b));
 
         // 两者都在 24 小时临期窗口内，更早过期的账号 A 必须排在前面
         let excluded = HashSet::new();
@@ -12064,8 +12049,12 @@ mod tests {
         token_a.account_path = temp_dir.path().join("acc_low.json");
         token_b.account_path = temp_dir.path().join("acc_high.json");
 
-        manager.tokens.insert(token_a.account_id.clone(), token_a);
-        manager.tokens.insert(token_b.account_id.clone(), token_b);
+        manager
+            .tokens
+            .insert(token_a.account_id.clone(), Arc::new(token_a));
+        manager
+            .tokens
+            .insert(token_b.account_id.clone(), Arc::new(token_b));
 
         // 两者皆非临期：保持 Priority 1 规则，高配额账号 B (95%) 优先于低配额账号 A (40%)，保护低配额账号
         let excluded = HashSet::new();
@@ -12123,8 +12112,12 @@ mod tests {
         token_a.account_path = temp_dir.path().join("acc_zero.json");
         token_b.account_path = temp_dir.path().join("acc_has.json");
 
-        manager.tokens.insert(token_a.account_id.clone(), token_a);
-        manager.tokens.insert(token_b.account_id.clone(), token_b);
+        manager
+            .tokens
+            .insert(token_a.account_id.clone(), Arc::new(token_a));
+        manager
+            .tokens
+            .insert(token_b.account_id.clone(), Arc::new(token_b));
 
         let excluded = HashSet::new();
         let (_token, _project_id, email, selected_id, _wait) = manager
@@ -12158,7 +12151,9 @@ mod tests {
         token.account_id = account_id.to_string();
         token.model_quotas = quotas;
 
-        manager.tokens.insert(account_id.to_string(), token);
+        manager
+            .tokens
+            .insert(account_id.to_string(), Arc::new(token));
 
         // Verify initial state
         assert_eq!(
@@ -12227,7 +12222,9 @@ mod tests {
             .available_models
             .insert("claude-sonnet-4-6".to_string());
 
-        manager.tokens.insert(account_id.to_string(), token);
+        manager
+            .tokens
+            .insert(account_id.to_string(), Arc::new(token));
 
         // 1. 3P 模型应准确返回 0 配额
         assert_eq!(
@@ -12265,7 +12262,7 @@ mod tests {
             .insert("gemini-3.8-flash-high".to_string());
         manager
             .tokens
-            .insert("pro_no_argon".to_string(), token_pro_no_argon);
+            .insert("pro_no_argon".to_string(), Arc::new(token_pro_no_argon));
 
         // 2. 有独立 Argon 桶的 Pro 账号：有独立的 gemini-4-argon 配额 50%
         let mut token_pro_with_argon =
@@ -12285,7 +12282,7 @@ mod tests {
             .insert("gemini-3.8-flash-high".to_string());
         manager
             .tokens
-            .insert("pro_with_argon".to_string(), token_pro_with_argon);
+            .insert("pro_with_argon".to_string(), Arc::new(token_pro_with_argon));
 
         // 3. Ultra 账号：无独立桶，但享有 Argon 能力，配额共享通用大池 95%
         let mut token_ultra =
@@ -12303,7 +12300,9 @@ mod tests {
         token_ultra
             .available_models
             .insert("gemini-3.8-flash-high".to_string());
-        manager.tokens.insert("ultra".to_string(), token_ultra);
+        manager
+            .tokens
+            .insert("ultra".to_string(), Arc::new(token_ultra));
 
         // 验证 Argon 请求能力探测：
         // 无 Argon 的 Pro 被精确排除，具备能力的 2 个账号（有独立桶 Pro + Ultra）通过闸门
@@ -12560,8 +12559,12 @@ mod tests {
         token_a.account_path = temp_dir.path().join("acc_depleted.json");
         token_b.account_path = temp_dir.path().join("acc_healthy.json");
 
-        manager.tokens.insert(token_a.account_id.clone(), token_a);
-        manager.tokens.insert(token_b.account_id.clone(), token_b);
+        manager
+            .tokens
+            .insert(token_a.account_id.clone(), Arc::new(token_a));
+        manager
+            .tokens
+            .insert(token_b.account_id.clone(), Arc::new(token_b));
 
         let excluded = HashSet::new();
         let (_token, _project_id, email, selected_id, _wait) = manager
@@ -12626,7 +12629,9 @@ mod tests {
             model_quota_windows: HashMap::new(),
         };
 
-        manager.tokens.insert(token.account_id.clone(), token);
+        manager
+            .tokens
+            .insert(token.account_id.clone(), Arc::new(token));
 
         // 1. 测试 TokenManager 聚合
         let collected = manager.get_all_model_metadata();
@@ -12666,7 +12671,7 @@ mod tests {
         let email = "fail_user@example.com";
         let mut token = create_test_token(email, Some("PRO"), 1.0, None, Some(100));
         token.account_id = acc_id.to_string();
-        manager.tokens.insert(acc_id.to_string(), token);
+        manager.tokens.insert(acc_id.to_string(), Arc::new(token));
 
         let sid = "session-test-sticky-123";
         manager.commit_session(sid, acc_id);
@@ -12695,7 +12700,9 @@ mod tests {
         with_quota
             .model_quotas
             .insert("gemini-3.1-flash-image-4k".into(), 33);
-        manager.tokens.insert("img_acc_quota".into(), with_quota);
+        manager
+            .tokens
+            .insert("img_acc_quota".into(), Arc::new(with_quota));
 
         let mut zero_quota =
             create_test_token("img2@example.com", Some("PRO"), 1.0, None, Some(100));
@@ -12703,7 +12710,9 @@ mod tests {
         zero_quota
             .model_quotas
             .insert("gemini-3.1-flash-image-2k".into(), 0);
-        manager.tokens.insert("img_acc_zero".into(), zero_quota);
+        manager
+            .tokens
+            .insert("img_acc_zero".into(), Arc::new(zero_quota));
 
         assert_eq!(
             manager.accounts_with_positive_quota("gemini-3.1-flash-image"),
@@ -12731,7 +12740,7 @@ mod tests {
         let email = "gate@example.com";
         let mut token = create_test_token(email, Some("PRO"), 1.0, None, Some(100));
         token.account_id = acc_id.to_string();
-        manager.tokens.insert(acc_id.to_string(), token);
+        manager.tokens.insert(acc_id.to_string(), Arc::new(token));
 
         let sid = "sid-gate-exempt";
         manager.commit_session(sid, acc_id);
@@ -12984,8 +12993,8 @@ mod tests {
         token2.available_models.insert(target_model.to_string());
         token2.available_models.insert(norm_target.clone());
 
-        manager.tokens.insert("acc1".to_string(), token1);
-        manager.tokens.insert("acc2".to_string(), token2);
+        manager.tokens.insert("acc1".to_string(), Arc::new(token1));
+        manager.tokens.insert("acc2".to_string(), Arc::new(token2));
 
         // 首次调度：acc1 (50%) 优于 acc2 (40%)，被选中
         let (_token, _proj, email1, id1, _) = manager
@@ -13068,8 +13077,8 @@ mod tests {
         token2.model_quotas.insert(norm_target.clone(), 40);
         token2.remaining_quota = Some(40);
 
-        manager.tokens.insert("acc1".to_string(), token1);
-        manager.tokens.insert("acc2".to_string(), token2);
+        manager.tokens.insert("acc1".to_string(), Arc::new(token1));
+        manager.tokens.insert("acc2".to_string(), Arc::new(token2));
 
         let mut attempted = std::collections::HashSet::new();
         // 第一次选号：没有被排除，acc1 额度更高 (80%) 优先被选中
@@ -13134,8 +13143,12 @@ mod tests {
         token2.model_quotas.insert(target_model.to_string(), 40);
         token2.model_quotas.insert(norm_target.clone(), 40);
 
-        manager.tokens.insert("acc1".to_string(), token1.clone());
-        manager.tokens.insert("acc2".to_string(), token2.clone());
+        manager
+            .tokens
+            .insert("acc1".to_string(), Arc::new(token1.clone()));
+        manager
+            .tokens
+            .insert("acc2".to_string(), Arc::new(token2.clone()));
 
         // 阶段 1：重置时间尚未到达（now_ts < reset_time），acc1 处于 0% 耗尽中
         // P2C 必须过滤掉 acc1，仅能选中 acc2
@@ -13153,11 +13166,11 @@ mod tests {
 
         // 阶段 2：重置时间到达（通过过期自愈检测）
         // 模拟时间流逝（重置时间设在过去 10 秒）
-        let mut t1_expired = manager.tokens.get_mut("acc1").unwrap();
-        t1_expired
-            .model_reset_times
-            .insert("gemini".to_string(), now_ts - 10);
-        drop(t1_expired);
+        manager.mutate_token("acc1", |t1_expired| {
+            t1_expired
+                .model_reset_times
+                .insert("gemini".to_string(), now_ts - 10);
+        });
 
         let t1_ref = manager.tokens.get("acc1").unwrap();
         assert!(
@@ -13175,7 +13188,7 @@ mod tests {
         token3.account_id = "acc3".to_string();
         token3.available_models.insert(target_model.to_string());
         token3.model_quotas.insert(target_model.to_string(), 0);
-        manager.tokens.insert("acc3".to_string(), token3);
+        manager.tokens.insert("acc3".to_string(), Arc::new(token3));
 
         let candidates_with_exhausted = vec![
             manager.tokens.get("acc1").unwrap().clone(),
@@ -13802,8 +13815,12 @@ mod tests {
         assert_eq!(pool_pro.effective_priority(claude_model, claude_model), 50);
         assert_eq!(pool_pro.effective_priority(gemini_model, gemini_model), 50);
 
-        manager.tokens.insert("acc_personal".to_string(), personal);
-        manager.tokens.insert("acc_pool".to_string(), pool_pro);
+        manager
+            .tokens
+            .insert("acc_personal".to_string(), Arc::new(personal));
+        manager
+            .tokens
+            .insert("acc_pool".to_string(), Arc::new(pool_pro));
 
         // 1. Requesting Claude selects `acc_personal` (effective priority 1 < 50)
         let (tok_claude, _, _, id_claude, _) = manager
@@ -14132,11 +14149,15 @@ mod tests {
             }],
         );
 
-        manager.tokens.insert("nocap".to_string(), acc_no_cap);
-        manager.tokens.insert("shared".to_string(), acc_shared);
         manager
             .tokens
-            .insert("ded_zero".to_string(), acc_dedicated_zero);
+            .insert("nocap".to_string(), Arc::new(acc_no_cap));
+        manager
+            .tokens
+            .insert("shared".to_string(), Arc::new(acc_shared));
+        manager
+            .tokens
+            .insert("ded_zero".to_string(), Arc::new(acc_dedicated_zero));
 
         // Only acc_shared holds Hydrogen capability.
         assert_eq!(
@@ -14358,7 +14379,9 @@ mod tests {
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
         };
-        manager.tokens.insert("acc-active".to_string(), tok);
+        manager
+            .tokens
+            .insert("acc-active".to_string(), Arc::new(tok));
         let future_reset =
             chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + 3600, 0)
                 .unwrap()
@@ -14438,7 +14461,9 @@ mod tests {
             model_weekly_reset_times: HashMap::new(),
             model_quota_windows: HashMap::new(),
         };
-        manager.tokens.insert("acc-toggle".to_string(), tok);
+        manager
+            .tokens
+            .insert("acc-toggle".to_string(), Arc::new(tok));
         manager
             .set_preferred_account(Some("acc-toggle".to_string()))
             .await;

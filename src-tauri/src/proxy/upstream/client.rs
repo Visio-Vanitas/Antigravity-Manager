@@ -371,44 +371,11 @@ impl UploadProgress {
     }
 }
 
-/// 被动上行吞吐估计器：仅在真实请求上传成功后更新，不发起任何测速请求
-static UPLOAD_THROUGHPUT_EWMA_BPS: once_cell::sync::Lazy<parking_lot::RwLock<Option<f64>>> =
-    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(None));
-
-/// 读取当前被动上行速度估计（bytes/s）
-pub fn current_upload_throughput_bps() -> Option<u64> {
-    UPLOAD_THROUGHPUT_EWMA_BPS.read().map(|v| v as u64)
-}
-
-/// 用一个上传样本更新 EWMA（样本过小或过快时直接忽略）。
-///
-/// 阈值必须覆盖现场常见的 5~30KB/s 慢速上传；历史上 `<32KB/s` 被丢弃，
-/// 导致预算永远学不到慢速，只能按声明的 2Mbps 下限 5~18s 硬切。
-fn observe_upload_throughput(bps: u64) {
-    if bps < 4 * 1024 || bps > 1024 * 1024 * 1024 {
-        return;
-    }
-    let mut guard = UPLOAD_THROUGHPUT_EWMA_BPS.write();
-    let next = match *guard {
-        Some(prev) => prev * 0.7 + (bps as f64) * 0.3,
-        None => bps as f64,
-    };
-    *guard = Some(next);
-}
-
-/// 清空被动上行速度估计（单元测试隔离与运行时重置）
-pub fn reset_upload_throughput_estimate() {
-    *UPLOAD_THROUGHPUT_EWMA_BPS.write() = None;
-}
-
-/// 寄存器一次成功完成的上传样本
-pub fn record_upload_throughput_sample(bytes: usize, elapsed: std::time::Duration) {
-    let secs = elapsed.as_secs_f64();
-    if bytes == 0 || secs < 0.5 {
-        return;
-    }
-    observe_upload_throughput((bytes as f64 / secs) as u64);
-}
+pub use super::throughput_estimator::{
+    current_upload_throughput_bps, current_upload_throughput_bps_for, observe_upload_throughput,
+    observe_upload_throughput_for, record_upload_throughput_sample,
+    record_upload_throughput_sample_for, reset_upload_throughput_estimate,
+};
 
 /// 分阶段发送结果
 struct PhasedSendOutcome {
@@ -477,13 +444,32 @@ pub fn strip_internal_markers(error_text: &str) -> String {
 
 /// [NEW] 错误日志脱敏：抹除报错信息中的 access_token, proxy_url 等敏感凭证
 pub fn sanitize_error_for_log(error_text: &str) -> String {
-    // 抹除常见敏感 key 的值
-    let re = regex::Regex::new(r#"(?i)(access_token|refresh_token|id_token|authorization|api_key|secret|password|proxy_url|http_proxy|https_proxy)\s*[:=]\s*[^"'\\\s,}\]]+"#).unwrap();
-    let redacted = re.replace_all(error_text, "$1=<redacted>");
+    static SANITIZE_BEARER_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)(bearer\s+)[^"'\\\s,}\]]+"#).unwrap());
+    static SANITIZE_SENSITIVE_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+        || {
+            regex::Regex::new(r#"(?i)(access_token|refresh_token|id_token|api_key|secret|password|proxy_url|http_proxy|https_proxy)\s*[:=]\s*[^"'\\\s,}\]]+"#).unwrap()
+        },
+    );
+    static SANITIZE_AUTH_KEY_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r#"(?i)(authorization)\s*[:=]\s*([^"'\\\s,}\]]+)"#).unwrap()
+        });
 
-    // 抹除 Bearer token
-    let re_bearer = regex::Regex::new(r#"(?i)(bearer\s+)[^"'\\\s,}\]]+"#).unwrap();
-    let redacted = re_bearer.replace_all(&redacted, "$1<redacted>");
+    // 1. 优先抹除 Bearer token（防止 authorization: Bearer <tok> 先被截断吞掉 Bearer 导致真实 token 裸露）
+    let redacted = SANITIZE_BEARER_RE.replace_all(error_text, "$1<redacted>");
+
+    // 2. 抹除常见敏感 key 的值
+    let redacted = SANITIZE_SENSITIVE_KEY_RE.replace_all(&redacted, "$1=<redacted>");
+
+    // 3. 抹除裸 authorization 凭证（保留已被第 1 步脱敏的 Bearer <redacted>）
+    let redacted = SANITIZE_AUTH_KEY_RE.replace_all(&redacted, |caps: &regex::Captures| {
+        if caps[2].eq_ignore_ascii_case("bearer") {
+            caps[0].to_string()
+        } else {
+            format!("{}=<redacted>", &caps[1])
+        }
+    });
 
     // 限制长度防止日志炸弹 (UTF-8 字符边界安全保护)
     if redacted.len() > 1000 {
@@ -896,16 +882,17 @@ impl UpstreamClient {
         }
     }
 
-    /// Get client for a specific account (or default if no proxy bound)
-    pub async fn get_client(&self, account_id: Option<&str>) -> Client {
+    /// Get client and egress key for a specific account (or default if no proxy bound)
+    pub async fn get_client_with_egress(&self, account_id: Option<&str>) -> (Client, String) {
         if let Some(pool) = &self.proxy_pool {
             if let Some(acc_id) = account_id {
                 // Try to get per-account proxy
                 match pool.get_proxy_for_account(acc_id).await {
                     Ok(Some(proxy_cfg)) => {
+                        let egress_key = format!("pool:{}", proxy_cfg.entry_id);
                         // Check cache
                         if let Some(client) = self.client_cache.get(&proxy_cfg.entry_id) {
-                            return client.clone();
+                            return (client.clone(), egress_key);
                         }
                         // Build new client and cache it
                         match self.build_client_with_proxy(proxy_cfg.clone()) {
@@ -917,7 +904,7 @@ impl UpstreamClient {
                                     proxy_cfg.entry_id,
                                     acc_id
                                 );
-                                return client;
+                                return (client, egress_key);
                             }
                             Err(e) => {
                                 tracing::error!("Failed to build client for proxy {}: {}, falling back to default", proxy_cfg.entry_id, e);
@@ -938,7 +925,15 @@ impl UpstreamClient {
             }
         }
         // Fallback to default client
-        self.default_client.read().await.clone()
+        (
+            self.default_client.read().await.clone(),
+            "default".to_string(),
+        )
+    }
+
+    /// Get client for a specific account (or default if no proxy bound)
+    pub async fn get_client(&self, account_id: Option<&str>) -> Client {
+        self.get_client_with_egress(account_id).await.0
     }
 
     /// Build v1internal URL
@@ -1083,6 +1078,7 @@ impl UpstreamClient {
         stall_timeout: Duration,
         first_byte_wait: Duration,
         hard_deadline: std::time::Instant,
+        egress_key: &str,
     ) -> PhasedSendOutcome {
         use tokio::time::MissedTickBehavior;
 
@@ -1108,7 +1104,7 @@ impl UpstreamClient {
                     if finished {
                         let elapsed = upload_elapsed.unwrap_or_else(|| attempt_start.elapsed());
                         if let Some(bps) = progress.completed_throughput_bps(elapsed) {
-                            observe_upload_throughput(bps);
+                            observe_upload_throughput_for(egress_key, bps);
                         }
                     }
                     let stage = match res {
@@ -1193,7 +1189,7 @@ impl UpstreamClient {
                             // EWMA 永远停留在旧的高速值。
                             if let Some(elapsed) = progress.elapsed_since_first_byte() {
                                 if let Some(bps) = progress.completed_throughput_bps(elapsed) {
-                                    observe_upload_throughput(bps);
+                                    observe_upload_throughput_for(egress_key, bps);
                                 }
                             }
                             let soft_exceeded = progress
@@ -1505,8 +1501,8 @@ impl UpstreamClient {
             crate::proxy::pipeline::budget::set_estimated_tokens(payload_tokens);
         }
 
-        // [NEW] Get client based on account (cached in proxy pool manager)
-        let client = self.get_client(account_id).await;
+        // [NEW] Get client and egress key based on account (cached in proxy pool manager)
+        let (client, egress_key) = self.get_client_with_egress(account_id).await;
 
         // 构建 Headers (所有端点复用)
         let mut headers = header::HeaderMap::new();
@@ -1632,7 +1628,12 @@ impl UpstreamClient {
         let media_kind = detect_payload_media_kind(&body, method, is_image_gen);
         let upload_cfg = crate::proxy::get_upload_timeout_config();
         let stream_cfg = crate::proxy::config::get_stream_timeout_config();
-        let timeout_plan = Self::plan_upstream_timeouts(media_kind, body_bytes.len(), &upload_cfg);
+        let timeout_plan = Self::plan_upstream_timeouts_with_observed(
+            media_kind,
+            body_bytes.len(),
+            &upload_cfg,
+            current_upload_throughput_bps_for(&egress_key),
+        );
         // [Pipeline Budget] 四大协议共用的请求级硬上限：
         // 已经耗尽就不再发起新的上游尝试（避免带着 0 预算空转一圈又去轮换账号）。
         if crate::proxy::pipeline::budget::exhausted() {
@@ -1848,6 +1849,7 @@ impl UpstreamClient {
                             Duration::from_secs(timeout_plan.stall_secs),
                             Duration::from_secs(first_byte_budget_secs),
                             hard_deadline,
+                            &egress_key,
                         )
                         .await
                     }

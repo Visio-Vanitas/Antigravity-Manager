@@ -1,8 +1,13 @@
 pub mod comprehensive;
+pub mod concurrency_limiter_tests;
+pub mod egress_throughput_tests;
 pub mod gzip_decompression_tests;
+pub mod inbound_conn_tests;
+pub mod monitor_fastpath_tests;
 pub mod quota_protection;
 pub mod rate_limit_404_tests;
 pub mod retry_strategy_tests;
 pub mod security_integration_tests;
 pub mod security_ip_tests;
+pub mod sqlite_cache_concurrency_tests;
 pub mod ultra_priority_tests;

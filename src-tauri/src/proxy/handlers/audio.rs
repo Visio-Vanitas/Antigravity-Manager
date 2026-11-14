@@ -102,6 +102,11 @@ pub async fn handle_audio_transcription(
         .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
 
+    let _in_flight_guard = token_manager
+        .acquire_in_flight_bounded(&account_id)
+        .await
+        .map_err(|e| (StatusCode::TOO_MANY_REQUESTS, e))?;
+
     info!("使用账号: {}", email);
 
     // 7. 包装请求为 v1internal 格式

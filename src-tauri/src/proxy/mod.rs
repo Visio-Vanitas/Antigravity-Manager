@@ -8,6 +8,7 @@ pub mod server;
 pub mod token_manager;
 
 // 新架构模块
+pub mod account_limiter; // 单账号并发信号量与有界排队护栏
 pub mod audio; // 音频处理模块
 pub mod cache_manager; // Context Cache 管理 (前缀哈希 → cache_id 映射)
 pub mod cache_profile; // 签名缓存环境自适应预设
@@ -18,6 +19,7 @@ pub mod droid_sync; // Droid (Factory CLI) 配置同步
 pub mod handlers; // API 端点处理器
 pub mod hermes_sync; // Hermes Agent 配置同步
 pub mod http_session_store; // HTTP多轮对话会话历史存储
+pub mod inbound_conn; // 入站连接治理与双协议多路复用
 pub mod mappers; // 协议转换器
 pub mod middleware; // Axum 中间件
 pub mod model_specs; // 模型规格管理 (v4.1.29)
@@ -28,6 +30,7 @@ pub mod payload_audit; // 报文审计：头脱敏 / 简要存储
 pub mod proxy_pool; // 代理池管理器
 pub mod qos_guardian; // QoS 智能熔断与阶梯探针守卫
 pub mod rate_limit; // 限流跟踪
+pub mod session_bindings; // 粘性会话映射表（带容量上限与空闲 TTL）
 pub mod session_manager; // 会话指纹管理
 pub mod signature_cache; // Signature Cache (v3.3.16)
 pub mod stage_trace; // 请求阶段时间线（可观测性）

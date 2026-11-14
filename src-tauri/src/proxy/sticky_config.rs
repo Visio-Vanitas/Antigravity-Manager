@@ -50,6 +50,12 @@ pub struct StickySessionConfig {
     /// 粘性路由绑定作用域（默认 Session 会话级）
     #[serde(default)]
     pub affinity_scope: AffinityScope,
+    /// 单账号最大在途并发请求数 (0 表示不设硬并发拦截)
+    #[serde(default)]
+    pub max_concurrent_per_account: usize,
+    /// 单账号并发队列等待超时时间（毫秒，默认 5000）
+    #[serde(default = "default_account_queue_timeout_ms")]
+    pub account_queue_timeout_ms: u64,
 }
 
 impl StickySessionConfig {
@@ -76,6 +82,25 @@ impl StickySessionConfig {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(self.request_429_grace_ms)
             .clamp(200, 10_000)
+    }
+
+    /// 获取实际生效的单账号最大在途并发数（配置为 0 时回退读取环境变量 `ANTIGRAVITY_MAX_CONCURRENT_PER_ACCOUNT`）
+    pub fn resolve_max_concurrent_per_account(&self) -> usize {
+        if self.max_concurrent_per_account > 0 {
+            return self.max_concurrent_per_account;
+        }
+        std::env::var("ANTIGRAVITY_MAX_CONCURRENT_PER_ACCOUNT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    /// 获取实际生效的单账号并发队列等待超时时间（毫秒，支持环境变量 `ANTIGRAVITY_ACCOUNT_QUEUE_TIMEOUT_MS` 覆盖）
+    pub fn resolve_account_queue_timeout_ms(&self) -> u64 {
+        std::env::var("ANTIGRAVITY_ACCOUNT_QUEUE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(self.account_queue_timeout_ms)
     }
 }
 
@@ -105,6 +130,10 @@ fn default_max_spillover_accounts() -> usize {
     0
 }
 
+fn default_account_queue_timeout_ms() -> u64 {
+    5000
+}
+
 impl Default for StickySessionConfig {
     fn default() -> Self {
         Self {
@@ -113,6 +142,8 @@ impl Default for StickySessionConfig {
             request_429_grace_ms: 1500,
             max_spillover_accounts: 0,
             affinity_scope: AffinityScope::Session,
+            max_concurrent_per_account: 0,
+            account_queue_timeout_ms: default_account_queue_timeout_ms(),
         }
     }
 }

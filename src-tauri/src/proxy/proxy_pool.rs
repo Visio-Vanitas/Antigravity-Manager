@@ -31,6 +31,7 @@ pub fn init_global_proxy_pool(config: Arc<RwLock<ProxyPoolConfig>>) -> Arc<Proxy
 pub struct PoolProxyConfig {
     pub proxy: rquest::Proxy,
     pub entry_id: String,
+    pub proxy_url: String,
 }
 
 /// 代理池管理器
@@ -45,6 +46,9 @@ pub struct ProxyPoolManager {
 
     /// 轮询索引 (用于 RoundRobin 策略)
     round_robin_index: Arc<AtomicUsize>,
+
+    /// 生效 HttpClient 连接池缓存: (client_profile: 0=Chrome123/1=Standard, egress_fingerprint, timeout_secs) -> Client
+    effective_client_cache: DashMap<(u8, String, u64), Client>,
 }
 
 impl ProxyPoolManager {
@@ -71,7 +75,108 @@ impl ProxyPoolManager {
             usage_counter: Arc::new(DashMap::new()),
             account_bindings,
             round_robin_index: Arc::new(AtomicUsize::new(0)),
+            effective_client_cache: DashMap::new(),
         }
+    }
+
+    async fn get_or_build_effective_client(
+        &self,
+        account_id: Option<&str>,
+        timeout_secs: u64,
+        emulate_chrome: bool,
+    ) -> Client {
+        let profile_key: u8 = if emulate_chrome { 0 } else { 1 };
+        let client_tag = if emulate_chrome {
+            ""
+        } else {
+            " (Standard Client)"
+        };
+
+        // 尝试获取代理配置
+        let proxy_opt = if let Some(acc_id) = account_id {
+            self.get_proxy_for_account(acc_id).await.ok().flatten()
+        } else {
+            // 没有 account_id 的通用请求，如果代理池启用，则默认从中选择节点作为出口
+            let config = self.config.read().await;
+            if config.enabled {
+                let res = self.select_proxy_from_pool(&config).await.ok().flatten();
+                if let Some(ref p) = res {
+                    tracing::info!(
+                        "[Proxy] Route: Generic Request{} -> Proxy {} (Pool)",
+                        client_tag,
+                        p.entry_id
+                    );
+                } else {
+                    tracing::warn!(
+                        "[Proxy] Route: Generic Request{} -> No available proxy in pool, falling back to upstream or direct",
+                        client_tag
+                    );
+                }
+                res
+            } else {
+                tracing::debug!(
+                    "[Proxy] Route: Generic Request{} -> Proxy pool disabled",
+                    client_tag
+                );
+                None
+            }
+        };
+
+        let (egress_fingerprint, resolved_proxy) = if let Some(proxy_cfg) = proxy_opt {
+            (
+                format!("pool:{}:{}", proxy_cfg.entry_id, proxy_cfg.proxy_url),
+                Some(proxy_cfg.proxy),
+            )
+        } else if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+            let up = app_cfg.proxy.upstream_proxy;
+            if up.enabled && !up.url.is_empty() {
+                if let Ok(p) = rquest::Proxy::all(&up.url) {
+                    tracing::info!(
+                        "[Proxy] Route: {:?}{} -> Upstream: {} (AppConfig)",
+                        account_id.unwrap_or("Generic"),
+                        client_tag,
+                        up.url
+                    );
+                    (format!("upstream:{}", up.url), Some(p))
+                } else {
+                    ("direct".to_string(), None)
+                }
+            } else {
+                tracing::info!(
+                    "[Proxy] Route: {:?}{} -> Direct",
+                    account_id.unwrap_or("Generic"),
+                    client_tag
+                );
+                ("direct".to_string(), None)
+            }
+        } else {
+            ("direct".to_string(), None)
+        };
+
+        let cache_key = (profile_key, egress_fingerprint, timeout_secs);
+        if let Some(client) = self.effective_client_cache.get(&cache_key) {
+            return client.clone();
+        }
+
+        let mut builder = Client::builder();
+        if emulate_chrome {
+            builder = builder.emulation(Emulation::Chrome123);
+        }
+        builder = builder
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(45))
+            .timeout(Duration::from_secs(timeout_secs));
+        if let Some(p) = resolved_proxy {
+            builder = builder.proxy(p);
+        }
+
+        let client = builder.build().unwrap_or_else(|_| Client::new());
+        if self.effective_client_cache.len() > 256 {
+            self.effective_client_cache.clear();
+        }
+        self.effective_client_cache
+            .insert(cache_key, client.clone());
+        client
     }
 
     /// [NEW] 为指定账号获取“最终生效”的 HttpClient
@@ -84,62 +189,8 @@ impl ProxyPoolManager {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> Client {
-        let mut builder = Client::builder()
-            .emulation(Emulation::Chrome123)
-            .connect_timeout(Duration::from_secs(5))
-            .pool_idle_timeout(Duration::from_secs(45))
-            .timeout(Duration::from_secs(timeout_secs));
-
-        // 尝试获取代理配置
-        let proxy_opt = if let Some(acc_id) = account_id {
-            self.get_proxy_for_account(acc_id).await.ok().flatten()
-        } else {
-            // 没有 account_id 的通用请求，如果代理池启用，则默认从中选择节点作为出口
-            let config = self.config.read().await;
-            if config.enabled {
-                let res = self.select_proxy_from_pool(&config).await.ok().flatten();
-                if let Some(ref p) = res {
-                    tracing::info!(
-                        "[Proxy] Route: Generic Request -> Proxy {} (Pool)",
-                        p.entry_id
-                    );
-                } else {
-                    // [FIX #1583] 明确记录池中无可用代理的情况
-                    tracing::warn!("[Proxy] Route: Generic Request -> No available proxy in pool, falling back to upstream or direct");
-                }
-                res
-            } else {
-                tracing::debug!("[Proxy] Route: Generic Request -> Proxy pool disabled");
-                None
-            }
-        };
-
-        if let Some(proxy_cfg) = proxy_opt {
-            builder = builder.proxy(proxy_cfg.proxy);
-            // Already logged more detail in get_proxy_for_account or pool selection
-        } else {
-            // Fallback 到应用配置的单上游代理
-            if let Ok(app_cfg) = crate::modules::config::load_app_config() {
-                let up = app_cfg.proxy.upstream_proxy;
-                if up.enabled && !up.url.is_empty() {
-                    if let Ok(p) = rquest::Proxy::all(&up.url) {
-                        tracing::info!(
-                            "[Proxy] Route: {:?} -> Upstream: {} (AppConfig)",
-                            account_id.unwrap_or("Generic"),
-                            up.url
-                        );
-                        builder = builder.proxy(p);
-                    }
-                } else {
-                    tracing::info!(
-                        "[Proxy] Route: {:?} -> Direct",
-                        account_id.unwrap_or("Generic")
-                    );
-                }
-            }
-        }
-
-        builder.build().unwrap_or_else(|_| Client::new())
+        self.get_or_build_effective_client(account_id, timeout_secs, true)
+            .await
     }
 
     /// [NEW] 为指定账号获取“最终生效”的无特征 Standard HttpClient (专门用于纯净场景，如 OAuth 退还)
@@ -148,62 +199,8 @@ impl ProxyPoolManager {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> Client {
-        let mut builder = Client::builder()
-            // 无 Emulation 设置，走纯正的基础 TLS 指纹
-            .connect_timeout(Duration::from_secs(5))
-            .pool_idle_timeout(Duration::from_secs(45))
-            .timeout(Duration::from_secs(timeout_secs));
-
-        // 尝试获取代理配置
-        let proxy_opt = if let Some(acc_id) = account_id {
-            self.get_proxy_for_account(acc_id).await.ok().flatten()
-        } else {
-            // 没有 account_id 的通用请求，如果代理池启用，则默认从中选择节点作为出口
-            let config = self.config.read().await;
-            if config.enabled {
-                let res = self.select_proxy_from_pool(&config).await.ok().flatten();
-                if let Some(ref p) = res {
-                    tracing::info!(
-                        "[Proxy] Route: Generic Request (Standard Client) -> Proxy {} (Pool)",
-                        p.entry_id
-                    );
-                } else {
-                    tracing::warn!("[Proxy] Route: Generic Request (Standard Client) -> No available proxy in pool, falling back to upstream or direct");
-                }
-                res
-            } else {
-                tracing::debug!(
-                    "[Proxy] Route: Generic Request (Standard Client) -> Proxy pool disabled"
-                );
-                None
-            }
-        };
-
-        if let Some(proxy_cfg) = proxy_opt {
-            builder = builder.proxy(proxy_cfg.proxy);
-        } else {
-            // Fallback 到应用配置的单上游代理
-            if let Ok(app_cfg) = crate::modules::config::load_app_config() {
-                let up = app_cfg.proxy.upstream_proxy;
-                if up.enabled && !up.url.is_empty() {
-                    if let Ok(p) = rquest::Proxy::all(&up.url) {
-                        tracing::info!(
-                            "[Proxy] Route: {:?} (Standard Client) -> Upstream: {} (AppConfig)",
-                            account_id.unwrap_or("Generic"),
-                            up.url
-                        );
-                        builder = builder.proxy(p);
-                    }
-                } else {
-                    tracing::info!(
-                        "[Proxy] Route: {:?} (Standard Client) -> Direct",
-                        account_id.unwrap_or("Generic")
-                    );
-                }
-            }
-        }
-
-        builder.build().unwrap_or_else(|_| Client::new())
+        self.get_or_build_effective_client(account_id, timeout_secs, false)
+            .await
     }
 
     /// 为账号获取代理
@@ -432,6 +429,7 @@ impl ProxyPoolManager {
         Ok(PoolProxyConfig {
             proxy,
             entry_id: entry.id.clone(),
+            proxy_url: raw_url,
         })
     }
 
@@ -471,6 +469,7 @@ impl ProxyPoolManager {
         // 更新内存中的绑定
         self.account_bindings
             .insert(account_id.clone(), proxy_id.clone());
+        self.effective_client_cache.clear();
 
         // 持久化到配置文件
         self.persist_bindings().await;
@@ -486,6 +485,7 @@ impl ProxyPoolManager {
     /// 解绑账号代理
     pub async fn unbind_account_proxy(&self, account_id: String) {
         self.account_bindings.remove(&account_id);
+        self.effective_client_cache.clear();
 
         // 持久化到配置文件
         self.persist_bindings().await;
@@ -519,6 +519,7 @@ impl ProxyPoolManager {
 
         // Reset the DashMap: clear old entries, then insert fresh ones.
         self.account_bindings.clear();
+        self.effective_client_cache.clear();
         for (account_id, proxy_id) in &snapshot {
             self.account_bindings
                 .insert(account_id.clone(), proxy_id.clone());
@@ -596,6 +597,7 @@ impl ProxyPoolManager {
                 proxy.last_check_time = Some(chrono::Utc::now().timestamp());
             }
         }
+        self.effective_client_cache.clear();
 
         Ok(())
     }

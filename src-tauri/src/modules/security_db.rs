@@ -3,7 +3,7 @@
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// IP 访问日志
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,23 +70,30 @@ pub fn get_security_db_path() -> Result<PathBuf, String> {
     Ok(data_dir.join("security.db"))
 }
 
-/// 连接数据库
-fn connect_db() -> Result<Connection, String> {
-    let db_path = get_security_db_path()?;
+/// 打开指定路径的安全数据库连接并配置高并发 PRAGMA
+pub(crate) fn open_conn_at(db_path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    // Set busy timeout FIRST before WAL mode transition (which acquires a DB lock)
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(|e| e.to_string())?;
 
     // Enable WAL mode for better concurrency
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
 
-    // Set busy timeout
-    conn.pragma_update(None, "busy_timeout", 5000)
-        .map_err(|e| e.to_string())?;
-
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
 
+    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+
     Ok(conn)
+}
+
+/// 连接数据库
+fn connect_db() -> Result<Connection, String> {
+    let db_path = get_security_db_path()?;
+    open_conn_at(&db_path)
 }
 
 /// 初始化安全数据库
@@ -167,12 +174,19 @@ pub fn init_db() -> Result<(), String> {
     // Migration: Add username column to ip_access_logs
     let _ = conn.execute("ALTER TABLE ip_access_logs ADD COLUMN username TEXT", []);
 
+    crate::modules::security_cache::invalidate();
+
     Ok(())
 }
 
 // ============================================================================
 // IP 访问日志操作
 // ============================================================================
+
+/// 异步批量保存 IP 访问日志
+pub fn save_ip_access_log_async(log: IpAccessLog) -> Result<(), String> {
+    crate::modules::security_cache::enqueue_access_log(log)
+}
 
 /// 保存 IP 访问日志
 pub fn save_ip_access_log(log: &IpAccessLog) -> Result<(), String> {
@@ -400,6 +414,8 @@ pub fn add_to_blacklist(
     )
     .map_err(|e| e.to_string())?;
 
+    crate::modules::security_cache::invalidate();
+
     Ok(IpBlacklistEntry {
         id,
         ip_pattern: ip_pattern.to_string(),
@@ -418,11 +434,13 @@ pub fn remove_from_blacklist(id: &str) -> Result<(), String> {
     conn.execute("DELETE FROM ip_blacklist WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
 
+    crate::modules::security_cache::invalidate();
+
     Ok(())
 }
 
-/// 获取黑名单列表
-pub fn get_blacklist() -> Result<Vec<IpBlacklistEntry>, String> {
+/// 从数据库直接加载黑名单列表
+pub(crate) fn load_blacklist_from_db() -> Result<Vec<IpBlacklistEntry>, String> {
     let conn = connect_db()?;
 
     let mut stmt = conn
@@ -454,87 +472,27 @@ pub fn get_blacklist() -> Result<Vec<IpBlacklistEntry>, String> {
     Ok(entries)
 }
 
+/// 获取黑名单列表 (合并内存中尚未刷盘的 hit_count 增量)
+pub fn get_blacklist() -> Result<Vec<IpBlacklistEntry>, String> {
+    let mut entries = load_blacklist_from_db()?;
+    for entry in &mut entries {
+        entry.hit_count += crate::modules::security_cache::pending_hit_count(&entry.id);
+    }
+    Ok(entries)
+}
+
 /// 检查 IP 是否在黑名单中
 pub fn is_ip_in_blacklist(ip: &str) -> Result<bool, String> {
     get_blacklist_entry_for_ip(ip).map(|entry| entry.is_some())
 }
 
-/// 获取 IP 对应的黑名单条目（如果存在）
+/// 获取 IP 对应的黑名单条目（纯内存快照判定，零 SQLite 写锁）
 pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, String> {
-    let conn = connect_db()?;
-    let now = chrono::Utc::now().timestamp();
-
-    // 清理过期的黑名单条目
-    let _ = conn.execute(
-        "DELETE FROM ip_blacklist WHERE expires_at IS NOT NULL AND expires_at < ?1",
-        [now],
-    );
-
-    // 精确匹配
-    let entry_result = conn.query_row(
-        "SELECT id, ip_pattern, reason, created_at, expires_at, created_by, hit_count
-         FROM ip_blacklist WHERE ip_pattern = ?1",
-        [ip],
-        |row| {
-            Ok(IpBlacklistEntry {
-                id: row.get(0)?,
-                ip_pattern: row.get(1)?,
-                reason: row.get(2)?,
-                created_at: row.get(3)?,
-                expires_at: row.get(4)?,
-                created_by: row.get(5)?,
-                hit_count: row.get(6)?,
-            })
-        },
-    );
-
-    if let Ok(entry) = entry_result {
-        // 增加命中计数
-        let _ = conn.execute(
-            "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE ip_pattern = ?1",
-            [ip],
-        );
-        return Ok(Some(entry));
-    }
-
-    // CIDR 匹配与 IP 等价匹配
-    let entries = get_blacklist()?;
-    for entry in entries {
-        if entry.ip_pattern.contains('/') {
-            if cidr_match(ip, &entry.ip_pattern) {
-                // 增加命中计数
-                let _ = conn.execute(
-                    "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE id = ?1",
-                    [&entry.id],
-                );
-                return Ok(Some(entry));
-            }
-        } else if let (Ok(client_addr), Ok(entry_addr)) = (
-            ip.trim()
-                .trim_matches('[')
-                .trim_matches(']')
-                .parse::<std::net::IpAddr>(),
-            entry
-                .ip_pattern
-                .trim()
-                .trim_matches('[')
-                .trim_matches(']')
-                .parse::<std::net::IpAddr>(),
-        ) {
-            if client_addr == entry_addr {
-                let _ = conn.execute(
-                    "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE id = ?1",
-                    [&entry.id],
-                );
-                return Ok(Some(entry));
-            }
-        }
-    }
-
-    Ok(None)
+    crate::modules::security_cache::get_blacklist_entry_for_ip(ip)
 }
 
 /// CIDR 匹配 (同时支持 IPv4 和 IPv6)
+#[allow(dead_code)]
 fn cidr_match(ip: &str, cidr: &str) -> bool {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
@@ -633,6 +591,8 @@ pub fn add_to_whitelist(
     )
     .map_err(|e| e.to_string())?;
 
+    crate::modules::security_cache::invalidate();
+
     Ok(IpWhitelistEntry {
         id,
         ip_pattern: ip_pattern.to_string(),
@@ -648,11 +608,13 @@ pub fn remove_from_whitelist(id: &str) -> Result<(), String> {
     conn.execute("DELETE FROM ip_whitelist WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
 
+    crate::modules::security_cache::invalidate();
+
     Ok(())
 }
 
-/// 获取白名单列表
-pub fn get_whitelist() -> Result<Vec<IpWhitelistEntry>, String> {
+/// 从数据库直接加载白名单列表
+pub(crate) fn load_whitelist_from_db() -> Result<Vec<IpWhitelistEntry>, String> {
     let conn = connect_db()?;
 
     let mut stmt = conn
@@ -681,49 +643,14 @@ pub fn get_whitelist() -> Result<Vec<IpWhitelistEntry>, String> {
     Ok(entries)
 }
 
-/// 检查 IP 是否在白名单中
+/// 获取白名单列表
+pub fn get_whitelist() -> Result<Vec<IpWhitelistEntry>, String> {
+    load_whitelist_from_db()
+}
+
+/// 检查 IP 是否在白名单中（纯内存快照判定）
 pub fn is_ip_in_whitelist(ip: &str) -> Result<bool, String> {
-    let conn = connect_db()?;
-
-    // 精确匹配
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM ip_whitelist WHERE ip_pattern = ?1",
-            [ip],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-
-    if count > 0 {
-        return Ok(true);
-    }
-
-    // CIDR 匹配与 IP 等价匹配
-    let entries = get_whitelist()?;
-    for entry in entries {
-        if entry.ip_pattern.contains('/') {
-            if cidr_match(ip, &entry.ip_pattern) {
-                return Ok(true);
-            }
-        } else if let (Ok(client_addr), Ok(entry_addr)) = (
-            ip.trim()
-                .trim_matches('[')
-                .trim_matches(']')
-                .parse::<std::net::IpAddr>(),
-            entry
-                .ip_pattern
-                .trim()
-                .trim_matches('[')
-                .trim_matches(']')
-                .parse::<std::net::IpAddr>(),
-        ) {
-            if client_addr == entry_addr {
-                return Ok(true);
-            }
-        }
-    }
-
-    Ok(false)
+    crate::modules::security_cache::is_ip_in_whitelist(ip)
 }
 
 /// 清空所有 IP 访问日志

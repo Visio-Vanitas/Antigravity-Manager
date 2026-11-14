@@ -11,6 +11,10 @@ pub fn load_app_config() -> Result<AppConfig, String> {
     let data_dir = get_data_dir()?;
     let config_path = data_dir.join(CONFIG_FILE);
 
+    if let Some(cached) = super::config_cache::try_get_cached(&config_path) {
+        return Ok(cached);
+    }
+
     if !config_path.exists() {
         let config = AppConfig::new();
         // [FIX #1460] Persist initial config to prevent new API Key on every refresh
@@ -39,6 +43,8 @@ pub fn load_app_config() -> Result<AppConfig, String> {
             );
         }
     }
+
+    super::config_cache::store_cached(&config_path, &config);
 
     Ok(config)
 }
@@ -324,7 +330,11 @@ pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
         .map_err(|e| format!("failed_to_serialize_config: {}", e))?;
 
     crate::utils::fs::write_atomic(&config_path, content.as_bytes())
-        .map_err(|e| format!("failed_to_save_config: {}", e))
+        .map_err(|e| format!("failed_to_save_config: {}", e))?;
+
+    super::config_cache::store_cached(&config_path, config);
+
+    Ok(())
 }
 
 #[cfg(test)]

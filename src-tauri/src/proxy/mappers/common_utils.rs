@@ -1632,50 +1632,47 @@ mod tests {
     }
 }
 
+static MARKDOWN_BASE64_IMAGE_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"!\[.*?\]\(data:(image/[^;]+);base64,([a-zA-Z0-9+/=]+)\)").unwrap()
+    });
+
 /// [FIX] Parse markdown base64 images from text and split into Gemini parts
 /// This prevents base64 reflection bloat where generated images are sent back as huge text strings
 pub fn parse_markdown_images_to_parts(text: &str) -> Vec<Value> {
     let mut parts = Vec::new();
     // Match ![...](data:image/...;base64,...)
-    if let Ok(re) = regex::Regex::new(r"!\[.*?\]\(data:(image/[^;]+);base64,([a-zA-Z0-9+/=]+)\)") {
-        let mut last_match = 0;
+    let mut last_match = 0;
 
-        for cap in re.captures_iter(text) {
-            let m = cap.get(0).unwrap();
+    for cap in MARKDOWN_BASE64_IMAGE_RE.captures_iter(text) {
+        let m = cap.get(0).unwrap();
 
-            // Add preceding text
-            if m.start() > last_match {
-                let preceding = &text[last_match..m.start()];
-                if !preceding.trim().is_empty() {
-                    parts.push(json!({"text": preceding}));
-                }
-            }
-
-            // Add inlineData image
-            let mime = cap.get(1).unwrap().as_str();
-            let b64 = cap.get(2).unwrap().as_str();
-            let part = create_gemini_inline_part(Some(mime), b64, "Markdown Image");
-            parts.push(part);
-
-            last_match = m.end();
-        }
-
-        // Add remaining text
-        if last_match < text.len() {
-            let remaining = &text[last_match..];
-            if !remaining.trim().is_empty() {
-                parts.push(json!({"text": remaining}));
+        // Add preceding text
+        if m.start() > last_match {
+            let preceding = &text[last_match..m.start()];
+            if !preceding.trim().is_empty() {
+                parts.push(json!({"text": preceding}));
             }
         }
 
-        if parts.is_empty() && !text.trim().is_empty() {
-            parts.push(json!({"text": text}));
-        }
+        // Add inlineData image
+        let mime = cap.get(1).unwrap().as_str();
+        let b64 = cap.get(2).unwrap().as_str();
+        let part = create_gemini_inline_part(Some(mime), b64, "Markdown Image");
+        parts.push(part);
 
-        return parts;
+        last_match = m.end();
     }
 
-    if !text.trim().is_empty() {
+    // Add remaining text
+    if last_match < text.len() {
+        let remaining = &text[last_match..];
+        if !remaining.trim().is_empty() {
+            parts.push(json!({"text": remaining}));
+        }
+    }
+
+    if parts.is_empty() && !text.trim().is_empty() {
         parts.push(json!({"text": text}));
     }
 
@@ -1781,40 +1778,38 @@ pub fn extract_multimodal_from_tool_text(raw_text: &str, extra_parts: &mut Vec<V
 
     // 3. 严格检测 Markdown 图片语法：![alt](data:image/...;base64,...)
     // 只有明确采用 Markdown 图片语法的结构才允许解构提取，绝不从普通文本/终端输出中模糊切词匹配
-    if let Ok(re) = regex::Regex::new(r"!\[.*?\]\(data:(image/[^;]+);base64,([a-zA-Z0-9+/=]+)\)") {
-        let mut clean_text = String::new();
-        let mut last_match = 0;
-        let mut found_image = false;
+    let mut clean_text = String::new();
+    let mut last_match = 0;
+    let mut found_image = false;
 
-        for cap in re.captures_iter(raw_text) {
-            let m = cap.get(0).unwrap();
-            let mime_type = cap.get(1).unwrap().as_str();
-            let b64_data = cap.get(2).unwrap().as_str();
+    for cap in MARKDOWN_BASE64_IMAGE_RE.captures_iter(raw_text) {
+        let m = cap.get(0).unwrap();
+        let mime_type = cap.get(1).unwrap().as_str();
+        let b64_data = cap.get(2).unwrap().as_str();
 
-            if is_supported_tool_image_mime(mime_type) {
-                if let Some((valid_mime, valid_b64)) =
-                    validate_and_sanitize_inline_data(Some(mime_type), b64_data)
-                {
-                    clean_text.push_str(&raw_text[last_match..m.start()]);
-                    extra_parts.push(create_gemini_inline_part(
-                        Some(&valid_mime),
-                        &valid_b64,
-                        "Tool Result Image",
-                    ));
-                    clean_text.push_str(&format!(
-                        "[Image: forwarded to visual input ({})]",
-                        valid_mime
-                    ));
-                    last_match = m.end();
-                    found_image = true;
-                }
+        if is_supported_tool_image_mime(mime_type) {
+            if let Some((valid_mime, valid_b64)) =
+                validate_and_sanitize_inline_data(Some(mime_type), b64_data)
+            {
+                clean_text.push_str(&raw_text[last_match..m.start()]);
+                extra_parts.push(create_gemini_inline_part(
+                    Some(&valid_mime),
+                    &valid_b64,
+                    "Tool Result Image",
+                ));
+                clean_text.push_str(&format!(
+                    "[Image: forwarded to visual input ({})]",
+                    valid_mime
+                ));
+                last_match = m.end();
+                found_image = true;
             }
         }
+    }
 
-        if found_image {
-            clean_text.push_str(&raw_text[last_match..]);
-            return clean_text;
-        }
+    if found_image {
+        clean_text.push_str(&raw_text[last_match..]);
+        return clean_text;
     }
 
     // 4. 普通纯文本（代码、日志、测试数据等）：对齐官方原生，100% 原始透传，绝不破坏文本内容

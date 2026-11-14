@@ -1,0 +1,116 @@
+name: High-Concurrency Headless Build
+
+on:
+  push:
+    branches:
+      - "build/high-concurrency-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: high-concurrency-headless-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux-x64:
+    name: Build & Verify Linux x86_64 Release (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake curl file git golang-go jq \
+            libayatana-appindicator3-dev libclang-dev libgtk-3-dev \
+            libjavascriptcoregtk-4.1-dev libnm-dev librsvg2-dev \
+            libsoup-3.0-dev libssl-dev libwebkit2gtk-4.1-dev pkg-config
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Build frontend dist
+        run: |
+          npm ci --legacy-peer-deps --no-audit --no-fund
+          npm run build
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri"
+
+      - name: Format, Clippy & Concurrency Test Gate
+        working-directory: src-tauri
+        run: |
+          cargo fmt -- --check
+          cargo clippy --all-targets --all-features
+          cargo test --lib config_cache_tests -- --nocapture
+          cargo test --lib concurrency_limiter_tests -- --nocapture
+          cargo test --lib monitor_fastpath_tests -- --nocapture
+          cargo test --lib sqlite_cache_concurrency_tests -- --nocapture
+          cargo test --lib egress_throughput_tests -- --nocapture
+          cargo test --lib inbound_conn_tests -- --nocapture
+          cargo test --lib security_ip_tests -- --test-threads=1
+
+      - name: Build release binaries
+        working-directory: src-tauri
+        run: |
+          cargo build --release --bin antigravity-tools --bin antigravity-server
+
+      - name: Smoke test HTTP/1.1 & HTTP/2 h2c and package artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
+          cp src-tauri/target/release/antigravity-tools release-out/
+          cp src-tauri/target/release/antigravity-server release-out/
+          tar -czf release-out/dist.tar.gz -C dist .
+
+          max_glibc_tools=$(objdump -T release-out/antigravity-tools | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -n 1)
+          max_glibc_server=$(objdump -T release-out/antigravity-server | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -n 1)
+          echo "Max GLIBC (antigravity-tools):  $max_glibc_tools"
+          echo "Max GLIBC (antigravity-server): $max_glibc_server"
+
+          ABV_DATA_DIR=/tmp/agm-ci-smoke ABV_API_KEY=sk-ci-smoke ./release-out/antigravity-server --host 127.0.0.1 --port 28045 --pure-proxy >/tmp/agm-ci-smoke.log 2>&1 &
+          SRV_PID=$!
+          trap "kill $SRV_PID 2>/dev/null || true" EXIT
+          for _ in {1..40}; do
+            if curl -sf http://127.0.0.1:28045/healthz >/dev/null 2>&1; then break; fi
+            sleep 0.25
+          done
+          h1=$(curl -sf -o /dev/null -w '%{http_code}:%{http_version}' http://127.0.0.1:28045/healthz)
+          h2=$(curl -sf --http2-prior-knowledge -o /dev/null -w '%{http_code}:%{http_version}' http://127.0.0.1:28045/healthz)
+          echo "Smoke HTTP/1.1=$h1 HTTP/2(h2c)=$h2"
+          [[ "$h1" == "200:1.1" ]]
+          [[ "$h2" == "200:2" ]]
+          kill "$SRV_PID" 2>/dev/null || true
+
+          commit_sha=$(git rev-parse HEAD)
+          jq -n \
+            --arg commit "$commit_sha" \
+            --arg max_glibc_tools "$max_glibc_tools" \
+            --arg max_glibc_server "$max_glibc_server" \
+            --arg smoke_h1 "$h1" \
+            --arg smoke_h2 "$h2" \
+            '{commit:$commit, max_glibc_tools:$max_glibc_tools, max_glibc_server:$max_glibc_server, smoke_http1:$smoke_h1, smoke_http2_h2c:$smoke_h2}' \
+            > release-out/manifest.json
+          (cd release-out && sha256sum antigravity-tools antigravity-server dist.tar.gz manifest.json > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: antigravity-high-concurrency-linux-x64
+          path: release-out/
+          retention-days: 14
+          if-no-files-found: error

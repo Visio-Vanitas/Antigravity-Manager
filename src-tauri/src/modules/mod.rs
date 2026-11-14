@@ -5,6 +5,9 @@ pub mod cache;
 pub mod cli_handler;
 pub mod cloudflared;
 pub mod config;
+pub mod config_cache;
+#[cfg(test)]
+mod config_cache_tests;
 pub mod db;
 pub mod device;
 #[allow(dead_code)]
@@ -23,12 +26,15 @@ pub mod process;
 pub mod proxy_db;
 pub mod quota;
 pub mod scheduler;
+pub mod security_cache;
 pub mod security_db;
 pub mod startup_quiet;
 pub mod startup_refresh;
 pub mod token_stats;
+pub mod token_stats_writer;
 pub mod tray;
 pub mod update_checker;
+pub mod user_token_cache;
 pub mod user_token_db;
 pub mod version;
 

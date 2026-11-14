@@ -1181,9 +1181,14 @@ impl AxumServer {
         let server_cancel_token = cancel_token.clone();
         // 在新任务中启动服务器
         let handle = tokio::spawn(async move {
-            use hyper::server::conn::http1;
-            use hyper_util::rt::TokioIo;
+            use crate::proxy::inbound_conn::{
+                configure_tcp_stream, serve_inbound_connection, InboundConnectionLimiter,
+            };
+            use hyper::body::Incoming;
             use hyper_util::service::TowerToHyperService;
+            use tower::ServiceExt;
+
+            let conn_limiter = InboundConnectionLimiter::from_env();
 
             loop {
                 tokio::select! {
@@ -1194,7 +1199,7 @@ impl AxumServer {
                     res = listener.accept() => {
                         match res {
                             Ok((stream, remote_addr)) => {
-                                let io = TokioIo::new(stream);
+                                configure_tcp_stream(&stream);
 
                                 // 若为 IPv4 映射的 IPv6 地址 (如 ::ffff:192.168.1.1)，将其规范化为原生 IPv4 地址
                                 let normalized_remote_addr = match remote_addr {
@@ -1209,8 +1214,6 @@ impl AxumServer {
                                 };
 
                                 // 注入 ConnectInfo (用于获取真实 IP)
-                                use tower::ServiceExt;
-                                use hyper::body::Incoming;
                                 let app_with_info = app.clone().map_request(move |mut req: axum::http::Request<Incoming>| {
                                     req.extensions_mut().insert(axum::extract::ConnectInfo(normalized_remote_addr));
                                     req
@@ -1218,26 +1221,20 @@ impl AxumServer {
 
                                 let service = TowerToHyperService::new(app_with_info);
                                 let conn_cancel_token = server_cancel_token.clone();
+                                let limiter = conn_limiter.clone();
 
                                 tokio::task::spawn(async move {
-                                    let conn = http1::Builder::new()
-                                        .serve_connection(io, service)
-                                        .with_upgrades();
-                                    tokio::pin!(conn);
-
-                                    tokio::select! {
-                                        res = conn.as_mut() => {
-                                            if let Err(err) = res {
-                                                debug!("连接处理结束或出错: {:?}", err);
-                                            }
-                                        }
-                                        _ = conn_cancel_token.cancelled() => {
-                                            // 收到全局关闭通知，通知 Hyper 优雅终止连接
-                                            conn.as_mut().graceful_shutdown();
-                                            // 给予请求最多 500ms 缓冲，超时后自动强行断开并关闭底层套接字
-                                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), conn).await;
-                                        }
-                                    }
+                                    let Some(conn_guard) = limiter.acquire().await else {
+                                        drop(stream);
+                                        return;
+                                    };
+                                    serve_inbound_connection(
+                                        stream,
+                                        service,
+                                        conn_cancel_token,
+                                        conn_guard,
+                                    )
+                                    .await;
                                 });
                             }
                             Err(e) => {

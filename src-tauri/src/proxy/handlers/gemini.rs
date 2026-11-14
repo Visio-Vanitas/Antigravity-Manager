@@ -344,7 +344,33 @@ pub async fn handle_generate(
             }
         };
 
-        let in_flight_guard = Arc::new(token_manager.acquire_in_flight(&account_id));
+        let in_flight_guard = match token_manager.acquire_in_flight_bounded(&account_id).await {
+            Ok(guard) => Arc::new(guard),
+            Err(limit_err) => {
+                tracing::warn!(
+                    "[ConcurrencyLimiter] {} (attempt {}/{})",
+                    limit_err,
+                    attempt + 1,
+                    max_attempts
+                );
+                if attempt + 1 < max_attempts {
+                    attempted_accounts.insert(account_id.clone());
+                    force_rotate = true;
+                    continue;
+                }
+                return Ok((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(serde_json::json!({
+                        "error": {
+                            "code": 429,
+                            "message": limit_err,
+                            "status": "RESOURCE_EXHAUSTED"
+                        }
+                    })),
+                )
+                    .into_response());
+            }
+        };
 
         let mapped_model = token_manager
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
